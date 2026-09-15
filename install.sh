@@ -28,6 +28,12 @@ CONFIG_FILE="$CONF_DIR/config.env"
 REMOTE="${GDRIVE_REMOTE:-GoogleDrive}"
 REMOTE="${REMOTE%:}"
 FOLDERS="${GDRIVE_FOLDERS:-$CONF_DIR/folders.txt}"
+STATE_DIR="${GDRIVE_STATE_DIR:-$HOME/.local/state/rclone-gdrive-sync}"
+
+# The Omarchy bar widget is distributed as a plugin, which omarchy clones into
+# its own plugins directory. The installer neither installs nor removes it; it
+# only looks, so it can say why the widget has nothing to show yet.
+OMARCHY_PLUGIN_DIR="${GDRIVE_OMARCHY_PLUGIN_DIR:-$HOME/.config/omarchy/plugins/mhavo.gdrive-sync}"
 
 BIN_DIR="${GDRIVE_BIN_DIR:-$HOME/.local/bin}"
 UNIT_DIR="${GDRIVE_UNIT_DIR:-$HOME/.config/systemd/user}"
@@ -279,6 +285,19 @@ install_desktop() {
   fi
 }
 
+# --- Omarchy widget ---------------------------------------------------------
+# Advisory only: it changes nothing. The widget reads status.json, which is
+# written by the first real sync run, and the installer deliberately does not
+# perform one. Without this note a freshly installed widget looks broken.
+check_widget() {
+  [[ -d "$OMARCHY_PLUGIN_DIR" ]] || return 0
+  [[ -e "$STATE_DIR/status.json" ]] && return 0
+  step "Omarchy widget"
+  info "the widget is installed at $OMARCHY_PLUGIN_DIR"
+  info "but $STATE_DIR/status.json does not exist yet, so it has"
+  info "nothing to show. The first gdrive-sync run writes it."
+}
+
 # --- Uninstall --------------------------------------------------------------
 # Removes what the installer put there and nothing else. Synced files, the
 # config directory and the pinned IDs stay: they are yours, and a reinstall
@@ -335,6 +354,7 @@ link_scripts
 install_configs
 install_units
 install_desktop
+check_widget
 
 step "Next"
 if folders_configured; then

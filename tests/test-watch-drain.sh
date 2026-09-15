@@ -65,15 +65,15 @@ DIRTY=(); DIRTY["Documents"]=1
 out="$(drain 2>&1)"
 assert_contains "any other error is logged with its code" "$out" "3"
 
-# --- §7: the child's output does not leak into the watcher's log -------------
+# --- §7: the child's output reaches the journal ------------------------------
+# It used to be discarded, because gdrive-sync wrote a log file of its own and
+# nothing was lost. With logging moved to the journal, discarding it would leave
+# a watcher-triggered sync recorded by nothing but its exit code, while the same
+# run under the timer is logged in full.
 echo 0 > "$RC_FILE"
 DIRTY=(); DIRTY["Documents"]=1
 out="$(drain 2>&1)"
-if [[ "$out" == *"CHILD JUNK"* ]]; then
-  fail "the child's output does not leak into the watcher's log" "got: [$out]"
-else
-  pass "the child's output does not leak into the watcher's log"
-fi
+assert_contains "the child's output reaches the watcher's stdout" "$out" "CHILD JUNK"
 
 # --- R12: --only= as one word, the name unchanged ---------------------------
 echo 0 > "$RC_FILE"

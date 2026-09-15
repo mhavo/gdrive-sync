@@ -24,10 +24,16 @@ case "${1:-}" in
     exit "${RCLONE_LSD_RC:-0}"
     ;;
   lsf)
-    printf '%s' "${RCLONE_LSF_OUTPUT:-remote-entry}"
+    # ${VAR-default}, not ${VAR:-default}: an empty listing is a real answer
+    # from Drive (the folder exists but has nothing in it) and a test has to be
+    # able to ask for it.
+    printf '%s' "${RCLONE_LSF_OUTPUT-remote-entry}"
     exit "${RCLONE_LSF_RC:-0}"
     ;;
   bisync)
+    # A slow bisync is the only way a test can look at a run while it is still
+    # going: the in-progress status.json exists for exactly that window.
+    [[ -n "${RCLONE_BISYNC_SLEEP:-}" ]] && sleep "$RCLONE_BISYNC_SLEEP"
     exit "${RCLONE_BISYNC_RC:-0}"
     ;;
   *)

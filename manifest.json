@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "mhavo.gdrive-sync",
+  "name": "Google Drive sync",
+  "version": "1.0.0",
+  "author": "Miika Havo",
+  "license": "MIT",
+  "description": "Google Drive sync status in the Omarchy bar.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "omarchy/Panel.qml" },
+  "barWidget": {
+    "displayName": "Google Drive",
+    "description": "Sync status, per-folder results, and a manual sync trigger.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": { "showLabel": false, "staleAfterMin": 45, "stuckAfterMin": 30 },
+    "schema": [
+      { "key": "showLabel", "type": "boolean", "label": "Show text label",
+        "defaultValue": false },
+      { "key": "staleAfterMin", "type": "integer", "label": "Consider stale after (minutes)",
+        "min": 5, "max": 1440, "step": 5, "defaultValue": 45 },
+      { "key": "stuckAfterMin", "type": "integer", "label": "Base allowance for a running sync (minutes)",
+        "description": "A base, not the whole limit: one more minute is allowed per folder in the run, and the total is capped at 2 hours, which is where systemd stops the sync anyway. A run past the limit reads as stuck rather than syncing.",
+        "min": 5, "max": 240, "step": 5, "defaultValue": 30 }
+    ]
+  }
+}

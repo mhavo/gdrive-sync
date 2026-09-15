@@ -267,6 +267,136 @@ Documents
   in Drive  : renamed: Documents 2026
 ```
 
+`--status` asks Drive about every folder, so it costs a network round trip per
+folder and is meant for a human at a terminal.
+
+**For a program there are two files instead**, written by the tool itself and
+readable without touching the network:
+
+| File | Written by | What |
+|---|---|---|
+| `~/.local/state/rclone-gdrive-sync/status.json` | `gdrive-sync` | the last run: when it started and finished, its exit code, what triggered it, and one entry per folder with its result |
+| `~/.local/state/rclone-gdrive-sync/watcher.json` | `gdrive-watch` | what the watcher is doing: `watching`, `pending`, `syncing`, `retry` or `stopped` |
+
+```json
+{
+  "schema": 1,
+  "version": "0.1.0",
+  "run": { "started": "2026-09-15T14:32:01+03:00",
+           "finished": "2026-09-15T14:32:18+03:00",
+           "exit": 0, "trigger": "timer", "dryRun": false },
+  "folders": [
+    { "name": "Documents", "result": "ok", "at": "2026-09-15T14:32:09+03:00" },
+    { "name": "Archive", "result": "error", "at": "2026-09-15T14:32:17+03:00",
+      "reason": "ID does not resolve in Drive" }
+  ]
+}
+```
+
+`result` is one of `ok`, `error`, `skipped`, `initialising` or `running`, and
+`reason` repeats the same sentence the run logged — the file is a second
+rendering of the log, not a second opinion about it. Each write is atomic, so a
+reader never sees a half-written file, and a run in progress leaves `finished`
+at `null` with the folders it has not reached yet still marked `running`.
+
+Three things do not write it: a dry run, `--status` and `--list-paths`. Asking
+what would happen must not overwrite the record of what did.
+
+One thing the files deliberately do not say is whether a sync is running right
+now. The lock file is no help — it exists whether or not anything is running —
+so the answer is `finished: null`, qualified by the age of `started` so a
+crashed run stops claiming to be in progress.
+
+## Omarchy bar widget
+
+On [Omarchy](https://omarchy.org/) the repository doubles as a shell plugin: a
+bar widget that reads the two files above and shows sync state without your
+having to look for it. It is an indicator with three buttons, not a control
+panel — anything that can lose data stays in the CLI.
+
+```bash
+omarchy plugin add https://github.com/mhavo/gdrive-sync.git --enable
+cd ~/.config/omarchy/plugins/mhavo.gdrive-sync && ./install.sh
+```
+
+Either order works: the widget can be installed first and will say what is
+still missing, or `install.sh` can be run first from a clone of your own.
+
+| Icon | Means |
+|---|---|
+| normal | last run succeeded |
+| animated | a run is in progress |
+| `urgent` colour | the last run failed, or a folder reported an error |
+| dim | nothing has run in a while, the timer is off, or a run appears stuck |
+| dim, with a mark | `gdrive-sync` is not on `PATH`, or `folders.txt` is empty |
+
+"Appears stuck" scales with the work: the widget allows a base time (45 minutes
+by default) plus a minute per folder, capped at two hours because the unit's
+`TimeoutStartSec=2h` means no run outlives that anyway. A hundred folders take
+longer than a couple do, and an honest long run must not be reported as a dead
+one.
+
+The popup lists the last run and every folder with its result and, where one
+applies, the reason it failed or was skipped. Folders are ordered by severity
+rather than by their position in `folders.txt` — errors first, then skipped,
+then folders still running, with the healthy ones last — so a single failure
+among a hundred folders is at the top instead of somewhere down the scroll.
+Above eight folders the header adds a count (`99 ok · 1 error`). Its buttons are
+**Sync now** (`systemctl --user start gdrive-sync.service`, so the lock and the
+exit-75 contract behave exactly as they do from the timer), **Open folder** and
+**Follow log** (`journalctl --user -t gdrive-sync -t gdrive-watch -f`).
+
+Below those it opens the configuration: **Edit folders.txt** and **Edit
+filter.txt**, and **Edit config.env** only when that file exists. The omission
+is deliberate — an editor pointed at a missing `config.env` would create it on
+save with the default umask and none of the guidance in `examples/config.env`,
+while `install.sh` copies the example and sets the permissions to 600. Until
+then the popup says so instead. All three resolve `GDRIVE_FOLDERS` and
+`GDRIVE_FILTER` the same way the tool does, so a moved file opens where it
+actually lives. When nothing is configured yet, the buttons instead point at
+`install.sh` and at `folders.txt`; the widget never installs anything itself.
+
+Exit 75 is not shown as a failure. It means a run was already going and this
+one stood aside, which is the system working.
+
+**Removing it** takes both halves, because they are separate installs:
+`./install.sh --uninstall` removes the symlinks, units and desktop entry, and
+`omarchy plugin remove mhavo.gdrive-sync` removes the widget.
+
+One constraint worth knowing if you fork this: Omarchy refuses a plugin folder
+containing any symlink, so the repository must not gain one. `tests/test-manifest.sh`
+asserts that, and would otherwise be the last thing to notice.
+
+## Logs
+
+Everything this project prints goes to the systemd journal and nowhere else.
+There is no log file, no rotation to configure and nothing to clean up.
+
+```bash
+journalctl --user -t gdrive-sync -t gdrive-watch -f   # both, live
+journalctl --user -u gdrive-sync.service --since today
+journalctl --user -u gdrive-watch.service
+```
+
+Run by hand, the same output simply goes to your terminal.
+
+Earlier versions wrote `~/.local/state/rclone-gdrive-sync/logs/<date>.log` and
+deleted files older than 30 days. The reason for dropping it is size: rclone at
+`--log-level INFO` produced about 170 kB a day for two folders, so a hundred
+folders would be roughly 8.5 MB a day and a quarter of a gigabyte inside the
+retention window — with an age limit but no size limit, and cleanup that only
+ran when a sync ran. journald already does all of this, with limits the user can
+set once in `systemd-journald.conf` for the whole system.
+
+One consequence worth knowing: journald drops messages above a rate limit, by
+default around 10 000 in 30 seconds, and it drops them **quietly**. A hundred
+folders' worth of rclone INFO exceeds that, so both units set
+`LogRateLimitIntervalSec=0`. Remove that line and the log silently develops
+holes exactly when the run is large enough for you to need it.
+
+**If you are upgrading**, your old `logs/` directory is still there. Nothing
+deletes it for you; remove it by hand when you no longer want it.
+
 ## Adding and removing a folder
 
 **Adding:** write a line into
@@ -318,7 +448,7 @@ trash and is not lost permanently.
 | `failed to get token` / auth errors in the log | Check the remote itself first: `rclone lsd GoogleDrive:` |
 | Timer off | `systemctl --user disable --now gdrive-sync.timer` — running by hand still works |
 | Watcher off | `systemctl --user disable --now gdrive-watch.service` — the timer keeps syncing |
-| You want to see what happened | `~/.local/state/rclone-gdrive-sync/logs/`, one file per day, cleaned up after 30 days. The watcher logs to the journal: `journalctl --user -u gdrive-watch` |
+| You want to see what happened | Everything is in the journal: `journalctl --user -t gdrive-sync -t gdrive-watch -f` for both, or `-u gdrive-sync.service` for one timer run |
 
 ## What lives where
 
@@ -329,7 +459,10 @@ trash and is not lost permanently.
 | `~/.config/rclone-gdrive-sync/filter.txt` | junk files to skip (`.DS_Store`, `Thumbs.db`, lock files) |
 | `~/GoogleDrive/` | synced content |
 | `~/.local/state/rclone-gdrive-sync/initialized/` | recorded folder IDs |
-| `~/.local/state/rclone-gdrive-sync/logs/` | logs |
+| the systemd journal | logs — this project writes no log file |
+| `~/.local/state/rclone-gdrive-sync/status.json` | last run, machine-readable |
+| `~/.local/state/rclone-gdrive-sync/watcher.json` | watcher state, machine-readable |
+| `~/.config/omarchy/plugins/mhavo.gdrive-sync/` | the Omarchy widget, when installed |
 | `~/.cache/rclone/bisync/` | rclone's comparison listings, built by `--resync` |
 
 ## Design notes
@@ -349,6 +482,17 @@ Reasons for individual choices, in case they look arbitrary:
 - **Exit code 75** (`EX_TEMPFAIL`) when the lock is held — the timer treats it
   as success (`SuccessExitStatus=75`), while `gdrive-watch` needs to tell it
   apart from a real sync so it does not record a missed change as synced.
+- **The watcher passes its child's output through** — a sync the watcher
+  triggers writes to the journal under `gdrive-watch`, because the child
+  inherits the watcher's stdout. It used to be discarded, which cost nothing
+  while `gdrive-sync` also wrote its own log file. Once that file was gone,
+  discarding it would have left a watcher-triggered sync recorded by nothing
+  but an exit code, while the identical run from the timer was logged in full.
+- **Two status files rather than one** — `gdrive-sync` and `gdrive-watch` run
+  at the same time by design. Sharing one file would make every write a
+  read-modify-write, and the watcher marking a folder pending while a sync
+  writes its result would lose one of the two. With a single writer each, both
+  writes are a plain atomic replace and need no lock; the reader merges them.
 - **`StartLimitIntervalSec=0`** on the watcher unit — the watcher exits 0 on
   purpose when `folders.txt` changes, so systemd re-reads the folder table.
   systemd's default limit (5 starts in 10 seconds) would leave the unit

@@ -33,8 +33,8 @@ FOLDERS="${GDRIVE_FOLDERS:-$CONF_DIR/folders.txt}"
 FILTER="${GDRIVE_FILTER:-$CONF_DIR/filter.txt}"
 STATE_DIR="${GDRIVE_STATE_DIR:-$HOME/.local/state/rclone-gdrive-sync}"
 INIT_DIR="$STATE_DIR/initialized"
-LOG_DIR="$STATE_DIR/logs"
 LOCK="$STATE_DIR/lock"
+STATUS_FILE="$STATE_DIR/status.json"
 
 DRY_RUN=0
 FORCE_RESYNC=0
@@ -75,12 +75,31 @@ gdrive-sync [options]
 
 Settings:    $CONFIG_FILE (optional)
 Folder list: $FOLDERS
-Logs:        $LOG_DIR/
+Logs:        journalctl --user -u gdrive-sync (or stdout when run by hand)
 HELP
       exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
+
+# --- The run record ---------------------------------------------------------
+# status.json is what the Omarchy widget reads; nothing else consumes it. It is
+# written only by a real sync run: a preview (-n) and the read-only queries must
+# not overwrite the record of the last real run, or the desktop would report a
+# preview as the last thing that happened.
+TRIGGER="${GDRIVE_TRIGGER:-manual}"
+STATUS_ENABLED=0
+RUN_STARTED=""
+if [[ "$ACTION" == "sync" ]] && (( ! DRY_RUN )); then
+  STATUS_ENABLED=1
+  # Not read before this point on purpose: --list-paths runs on a PATH that has
+  # no date on it, and it has to keep working there.
+  RUN_STARTED="$(date --iso-8601=seconds)"
+fi
+
+# The folder table of the run, as parallel arrays. A folder name contains
+# spaces, brackets and slashes often enough that one string would not survive.
+F_NAMES=(); F_RESULTS=(); F_ATS=(); F_REASONS=()
 
 # Legacy state files replaced slashes and spaces with underscores, which is not
 # one-to-one. Keep that spelling only for safe migration of existing markers.
@@ -116,6 +135,13 @@ parse_line() {
     (( STATE_KEYS_REQUIRED )) && key="path_$(state_hash "$path")"
   fi
   return 0
+}
+
+# --only= matches either spelling of the line: the line as written, or the local
+# folder name. Defined next to parse_line, because it reads what parse_line set.
+selected() {
+  [[ -z "$ONLY" ]] && return 0
+  [[ "$ONLY" == "$spec" || "$ONLY" == "$lname" ]]
 }
 
 # --- Reading the folder list ------------------------------------------------
@@ -179,14 +205,105 @@ command -v jq >/dev/null || { echo "jq is missing — needed to resolve IDs" >&2
 command -v sha256sum >/dev/null || { echo "sha256sum is missing — needed for state keys" >&2; exit 1; }
 STATE_KEYS_REQUIRED=1
 
+# Built with jq, never by pasting strings together: folder names come from
+# Google Drive and contain quotes, backslashes and newlines as readily as
+# anything else a user can type.
+status_write() {
+  (( STATUS_ENABLED )) || return 0
+  local finished="$1" exit_code="$2" tmp folders_json i
+  local -a entries=()
+  for i in "${!F_NAMES[@]}"; do
+    entries+=("$(jq -nc \
+      --arg name "${F_NAMES[$i]}" --arg result "${F_RESULTS[$i]}" \
+      --arg at "${F_ATS[$i]}" --arg reason "${F_REASONS[$i]}" \
+      '{name: $name, result: $result, at: $at}
+       + (if $reason == "" then {} else {reason: $reason} end)')") || return 0
+  done
+  folders_json="$(printf '%s\n' "${entries[@]+"${entries[@]}"}" | jq -sc '.')" || return 0
+
+  # The temporary file is in the same directory as the target, so the mv is a
+  # rename inside one filesystem and therefore atomic. A reader polling the file
+  # sees either the previous run record or this one, never half of either.
+  tmp="$STATUS_FILE.tmp.$$"
+  if jq -n \
+      --arg version "$VERSION" \
+      --arg started "$RUN_STARTED" \
+      --arg finished "$finished" \
+      --arg exit_code "$exit_code" \
+      --arg trigger "$TRIGGER" \
+      --argjson folders "$folders_json" \
+      '{schema: 1,
+        version: $version,
+        run: {
+          started:  $started,
+          finished: (if $finished  == "" then null else $finished end),
+          exit:     (if $exit_code == "" then null else ($exit_code | tonumber) end),
+          trigger:  $trigger,
+          dryRun:   false
+        },
+        folders: $folders}' > "$tmp" 2>/dev/null; then
+    mv -- "$tmp" "$STATUS_FILE" || rm -f -- "$tmp"
+  else
+    rm -f -- "$tmp"
+  fi
+  return 0
+}
+
+# Every selected folder starts as "running" so that the file names the work
+# still outstanding, not only what has already finished. Each folder's entry is
+# replaced by its real result as it completes.
+status_init_folders() {
+  (( STATUS_ENABLED )) || return 0
+  local spec_line parsed
+  F_NAMES=(); F_RESULTS=(); F_ATS=(); F_REASONS=()
+  for spec_line in "${LINES[@]}"; do
+    # The parse error itself is reported by the main loop; this pass is silent
+    # so the message is not printed twice.
+    if parse_line "$spec_line" 2>/dev/null; then parsed=1; else parsed=0; fi
+    selected || continue
+    if (( parsed )); then F_NAMES+=("$lname"); else F_NAMES+=("$spec_line"); fi
+    F_RESULTS+=("running"); F_ATS+=("$RUN_STARTED"); F_REASONS+=("")
+  done
+}
+
+# Records one folder's outcome and republishes the file. validate_lines has
+# already refused two entries with the same local name, so the name identifies
+# exactly one row.
+status_folder_result() {
+  (( STATUS_ENABLED )) || return 0
+  local name="$1" result="$2" reason="${3:-}" i
+  for i in "${!F_NAMES[@]}"; do
+    if [[ "${F_NAMES[$i]}" == "$name" ]]; then
+      F_RESULTS[i]="$result"
+      F_ATS[i]="$(date --iso-8601=seconds)"
+      F_REASONS[i]="$reason"
+      break
+    fi
+  done
+  status_write "" ""
+}
+
+# Runs from the EXIT trap only, which is why shellcheck cannot see the call.
+# $? has to be read first: everything after this line overwrites it.
+# shellcheck disable=SC2329
+status_finish() {
+  local rc=$?
+  status_write "$(date --iso-8601=seconds)" "$rc"
+}
+
 # Real runs create and lock persistent state. A dry-run takes the existing lock
 # read-only when one exists, but does not create state merely to preview work.
 if (( ! DRY_RUN )); then
-  mkdir -p "$INIT_DIR" "$LOG_DIR" "$LOCAL_ROOT"
+  mkdir -p "$INIT_DIR" "$LOCAL_ROOT"
   exec 9>"$LOCK"
 elif [[ -r "$LOCK" ]]; then
   exec 9<"$LOCK"
 fi
+# From here every exit is the end of a run, including the failure to get the
+# lock and a folder list that turns out to be missing. A trap is the only way to
+# write the closing record from all of them without repeating it at each exit.
+(( STATUS_ENABLED )) && trap status_finish EXIT
+
 if { (( ! DRY_RUN )) || [[ -r "$LOCK" ]]; } && ! flock -n 9; then
   # 75 = EX_TEMPFAIL: "try again later". For the timer an overlapping run is not
   # an error (SuccessExitStatus=75), but gdrive-watch needs to tell it apart
@@ -198,12 +315,14 @@ fi
 load_lines
 validate_lines || exit 1
 
-LOG="$LOG_DIR/$(date +%Y-%m-%d).log"
-if (( DRY_RUN )); then
-  log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
-else
-  log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
-fi
+# Everything this script says goes to stdout and nowhere else: under the systemd
+# units that is the journal, and by hand it is the terminal. No log file is
+# written, so there is none to rotate and none to fill the disk.
+log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+
+# The first of the three writes: the run has started, nothing has finished.
+status_init_folders
+status_write "" ""
 
 COMMON=(
   --drive-export-formats url
@@ -216,7 +335,8 @@ COMMON=(
   --retries 3
   --low-level-retries 10
 )
-(( DRY_RUN )) || COMMON+=(--log-file "$LOG" --log-level INFO)
+# No --log-file: rclone's own output goes to stdout with the rest of the run.
+(( DRY_RUN )) || COMMON+=(--log-level INFO)
 BISYNC_OPTS=(
   --conflict-resolve newer
   --conflict-loser num
@@ -338,11 +458,6 @@ current_name() {
     | jq -r --arg id "$id" '.[] | select((.ID | sub(".*\t";"")) == $id) | .Name' | head -1
 }
 
-selected() {
-  [[ -z "$ONLY" ]] && return 0
-  [[ "$ONLY" == "$spec" || "$ONLY" == "$lname" ]]
-}
-
 # --- --status ---------------------------------------------------------------
 if [[ "$ACTION" == "status" ]]; then
   for spec_line in "${LINES[@]}"; do
@@ -386,7 +501,11 @@ fi
 rc_total=0
 
 for spec_line in "${LINES[@]}"; do
-  parse_line "$spec_line" || { rc_total=1; continue; }
+  if ! parse_line "$spec_line"; then
+    rc_total=1
+    status_folder_result "$spec_line" error "Invalid line (an id: line needs a local name): $spec_line"
+    continue
+  fi
   selected || continue
 
   marker="$INIT_DIR/$key"
@@ -395,6 +514,7 @@ for spec_line in "${LINES[@]}"; do
 
   if ! prepare_marker; then
     rc_total=1
+    status_folder_result "$lname" error "state marker does not match this folder, refusing to sync"
     continue
   fi
 
@@ -418,6 +538,7 @@ for spec_line in "${LINES[@]}"; do
       if (( ! DRY_RUN )) && ! marker_write "$marker" "$id" "$lname" "" 1; then
         log "==> $lname: ERROR — could not persist pending initialization"
         rc_total=1
+        status_folder_result "$lname" error "could not persist pending initialization"
         continue
       fi
       log "==> $lname: ID taken from the line, reinitialising"
@@ -428,11 +549,13 @@ for spec_line in "${LINES[@]}"; do
     resolve_rc=$?
     if (( resolve_rc != 0 )); then
       if (( resolve_rc == 2 )); then
-        log "    $lname: ERROR — folder path '$path' is ambiguous in Drive; use an id: entry"
+        reason="folder path '$path' is ambiguous in Drive; use an id: entry"
       else
-        log "    $lname: ERROR — folder not found in Drive at path '$path'"
+        reason="folder not found in Drive at path '$path'"
       fi
+      log "    $lname: ERROR — $reason"
       rc_total=1
+      status_folder_result "$lname" error "$reason"
       continue
     fi
     # Moving from a name-based initialisation changes the remote address, so
@@ -441,6 +564,7 @@ for spec_line in "${LINES[@]}"; do
     if (( ! DRY_RUN )) && ! marker_write "$marker" "$id" "${path##*/}" "$path" 1; then
       log "==> $lname: ERROR — could not persist pending initialization"
       rc_total=1
+      status_folder_result "$lname" error "could not persist pending initialization"
       continue
     fi
     log "    $lname: ID $id"
@@ -459,15 +583,21 @@ for spec_line in "${LINES[@]}"; do
   # its own here; the point of checking first is a named reason for the one
   # folder affected, while the others keep syncing.
   if ! remote_head="$(rclone lsf --max-depth 1 "$remote" 2>/dev/null)"; then
-    log "==> $lname: ERROR — ID $id does not resolve in Drive, skipping (no bisync)"
+    reason="ID $id does not resolve in Drive, skipping (no bisync)"
+    log "==> $lname: ERROR — $reason"
     rc_total=1
+    status_folder_result "$lname" error "$reason"
     continue
   fi
   if (( ! ALLOW_EMPTY )) && [[ -z "$remote_head" ]] \
      && [[ -n "$(ls -A "$local_path" 2>/dev/null)" ]]; then
-    log "==> $lname: ERROR — remote folder is empty but local is not. Skipping."
+    reason="remote folder is empty but local is not. Skipping."
+    log "==> $lname: ERROR — $reason"
     log "    Check Drive. If you emptied the folder on purpose: --allow-empty-remote"
     rc_total=1
+    # Not an error result: the folder was left alone deliberately, and the
+    # widget shows a skip differently from a failure.
+    status_folder_result "$lname" skipped "$reason"
     continue
   fi
 
@@ -475,8 +605,10 @@ for spec_line in "${LINES[@]}"; do
   if (( need_resync )) || [[ ! -e "$marker" ]]; then
     log "==> $lname: initialising (--resync)"
     opts+=(--resync --resync-mode newer)
+    ok_result="initialising"
   else
     log "==> $lname: bisync"
+    ok_result="ok"
   fi
 
   if rclone bisync "$remote" "$local_path" "${opts[@]}" "${COMMON[@]}"; then
@@ -485,21 +617,23 @@ for spec_line in "${LINES[@]}"; do
       if [[ ! -s "$marker" ]] && ! marker_write "$marker" "$id" "$lname" "$path" 0; then
         log "    $lname: ERROR — sync succeeded but state could not be persisted"
         rc_total=1
+        status_folder_result "$lname" error "sync succeeded but state could not be persisted"
         continue
       fi
       if ! sed -i '/^resync=1$/d' "$marker"; then
         log "    $lname: ERROR — sync succeeded but pending initialization could not be cleared"
         rc_total=1
+        status_folder_result "$lname" error "sync succeeded but pending initialization could not be cleared"
+        continue
       fi
     fi
+    status_folder_result "$lname" "$ok_result"
   else
     rc=$?
     rc_total=1
-    log "    $lname: ERROR (rclone exit $rc) — see $LOG"
+    log "    $lname: ERROR (rclone exit $rc) — see the output above"
+    status_folder_result "$lname" error "rclone exit $rc"
   fi
 done
-
-# Clean up logs older than 30 days after a real run only.
-(( DRY_RUN )) || find "$LOG_DIR" -name '*.log' -mtime +30 -delete 2>/dev/null
 
 exit $rc_total

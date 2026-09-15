@@ -26,9 +26,13 @@ done
 
 sync_unit="$(cat "$UNITS/gdrive-sync.service")"
 assert_contains "gdrive-sync.service: SuccessExitStatus=75" "$sync_unit" "SuccessExitStatus=75"
+# Both units log the whole run to the journal; systemd's default rate limit
+# would drop the excess silently.
+assert_contains "gdrive-sync.service: LogRateLimitIntervalSec=0" "$sync_unit" "LogRateLimitIntervalSec=0"
 
 watch_unit="$(cat "$UNITS/gdrive-watch.service")"
 for key in "Type=simple" "Restart=always" "RestartSec=2" "StartLimitIntervalSec=0" \
+           "LogRateLimitIntervalSec=0" \
            "WantedBy=default.target" "GDRIVE_SYNC_BIN=%h/.local/bin/gdrive-sync"; do
   assert_contains "gdrive-watch.service: $key" "$watch_unit" "$key"
 done

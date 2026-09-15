@@ -125,9 +125,6 @@ write_folders <<'EOF'
 Dry Preview
 EOF
 export RCLONE_LSJSON='[{"Name":"Dry Preview","ID":"preview-id"}]'
-mkdir -p "$GDRIVE_STATE_DIR/logs"
-printf 'keep me\n' > "$GDRIVE_STATE_DIR/logs/old.log"
-touch -d '40 days ago' "$GDRIVE_STATE_DIR/logs/old.log"
 markers_before="$(find "$GDRIVE_STATE_DIR/initialized" -type f -print 2>/dev/null | sort)"
 o="$("$GDRIVE_SYNC" -n 2>&1)"; r=$?
 assert_rc "dry-run succeeds" 0 "$r"
@@ -136,8 +133,25 @@ if [[ -e "$GDRIVE_LOCAL/Dry Preview" ]]; then
 else
   pass "dry-run does not create the selected local folder"
 fi
-assert_eq "dry-run keeps old logs" "keep me" "$(cat "$GDRIVE_STATE_DIR/logs/old.log")"
 assert_eq "dry-run creates no marker" "$markers_before" "$(find "$GDRIVE_STATE_DIR/initialized" -type f -print 2>/dev/null | sort)"
+
+# --- Logging is the journal's, not a file's ---------------------------------
+# rclone gets no --log-file and the script writes none, so a real run must leave
+# nothing behind under the state directory but the state it needs. Checked after
+# a run that syncs, because that is the only path that ever opened a log file.
+write_folders <<'EOF'
+Documents
+EOF
+export RCLONE_LSJSON='[{"Name":"Documents","ID":"documents-id"}]'
+: > "$RCLONE_CALLS"
+o="$("$GDRIVE_SYNC" 2>&1)"; r=$?
+assert_rc "a real run succeeds" 0 "$r"
+assert_no_path "a run creates no logs directory" "$GDRIVE_STATE_DIR/logs"
+assert_eq "a run writes no log file anywhere in the state directory" "" \
+  "$(find "$GDRIVE_STATE_DIR" -name '*.log' -print 2>/dev/null)"
+assert_eq "rclone is called without --log-file" "" \
+  "$(grep -F -- '--log-file' "$RCLONE_CALLS")"
+assert_contains "rclone still gets --log-level INFO" "$(cat "$RCLONE_CALLS")" "arg=--log-level"
 
 # --- R5: a missing and an empty folder list keep their message and code ------
 for action in --status --repin -n; do

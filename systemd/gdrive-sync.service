@@ -6,8 +6,18 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/gdrive-sync
+# Recorded in status.json, so the desktop widget can tell an unattended run
+# apart from one the user started.
+Environment=GDRIVE_TRIGGER=timer
 # 75 = an overlapping run (gdrive-watch held the lock). Not an error for the timer.
 SuccessExitStatus=75
+# rclone runs at --log-level INFO and the whole run goes to the journal, so a
+# sync over many folders produces thousands of lines in a short burst. systemd's
+# default rate limit (about 10 000 messages per 30 s) would drop the excess
+# silently, leaving a log that looks complete and is not. There is no partial
+# setting worth having here: either the record of a run is whole or it is
+# useless for diagnosing one.
+LogRateLimitIntervalSec=0
 Nice=10
 IOSchedulingClass=idle
 TimeoutStartSec=2h

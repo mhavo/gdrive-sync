@@ -19,6 +19,11 @@ Environment=GDRIVE_SYNC_BIN=%h/.local/bin/gdrive-sync
 ExecStart=%h/.local/bin/gdrive-watch
 Restart=always
 RestartSec=2
+# The watcher itself says little, but it is under this unit that an operator
+# looks for what a save actually triggered. The same reasoning as in
+# gdrive-sync.service applies: systemd's default rate limit drops messages
+# silently, and a silently truncated log is worse than a verbose one.
+LogRateLimitIntervalSec=0
 Nice=10
 IOSchedulingClass=idle
 

@@ -11,8 +11,9 @@
 # with gdrive-sync --list-paths. Line parsing stays in one place.
 #
 # All output goes to stdout and stderr, which under the systemd unit is the
-# journal. The watcher opens no log file of its own; the gdrive-sync runs it
-# triggers write to their own log as before.
+# journal. Neither this script nor gdrive-sync opens a log file of its own, and
+# the syncs this script triggers inherit its stdout, so their output lands in
+# the journal under this unit rather than vanishing.
 set -uo pipefail
 
 VERSION="0.1.0"
@@ -26,6 +27,8 @@ CONFIG_FILE="$CONF_DIR/config.env"
 [[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 FOLDERS="${GDRIVE_FOLDERS:-$CONF_DIR/folders.txt}"
+STATE_DIR="${GDRIVE_STATE_DIR:-$HOME/.local/state/rclone-gdrive-sync}"
+WATCHER_FILE="$STATE_DIR/watcher.json"
 DEBOUNCE_SEC="${GDRIVE_DEBOUNCE_SEC:-5}"
 RETRY_SEC="${GDRIVE_RETRY_SEC:-30}"
 SYNC_BIN="${GDRIVE_SYNC_BIN:-gdrive-sync}"
@@ -49,6 +52,68 @@ RETRY_PENDING=0
 
 log()  { printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
+
+# --- watcher.json -----------------------------------------------------------
+# The Omarchy widget's second input. gdrive-sync owns status.json and the
+# watcher owns this one: with a single writer per file neither needs a lock, and
+# a "pending" mark cannot lose a race with a sync result.
+#
+# Writing it is never allowed to stop the watching. jq is a dependency of
+# gdrive-sync rather than of this script (§--list-paths), and a missing state
+# directory is not this script's problem to fix, so both are simply skipped.
+WATCHER_STATE=""
+WATCHER_PENDING_SIG=""
+
+pending_signature() {
+  printf '%s\n' "${!DIRTY[@]}" | LC_ALL=C sort | tr '\n' '\x1f'
+}
+
+watcher_write() {
+  local state="$1" next_retry="${2:-}" key tmp pending_json
+  command -v jq >/dev/null || return 0
+  [[ -d "$STATE_DIR" ]] || mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+
+  local -a names=()
+  for key in "${!DIRTY[@]}"; do
+    names+=("$(jq -nc --arg n "$key" '$n')") || return 0
+  done
+  pending_json="$(printf '%s\n' "${names[@]+"${names[@]}"}" | jq -sc '.')" || return 0
+
+  # Temp file in the same directory as the target: the mv is then a rename
+  # inside one filesystem, so the widget reads either the old state or the new
+  # one and never a half-written file.
+  tmp="$WATCHER_FILE.tmp.$$"
+  if jq -n \
+      --arg state "$state" \
+      --argjson pending "$pending_json" \
+      --arg since "$(date --iso-8601=seconds)" \
+      --arg next "$next_retry" \
+      '{schema: 1,
+        state: $state,
+        pending: $pending,
+        since: $since,
+        nextRetry: (if $next == "" then null else $next end)}' > "$tmp" 2>/dev/null; then
+    mv -- "$tmp" "$WATCHER_FILE" || rm -f -- "$tmp"
+  else
+    rm -f -- "$tmp"
+  fi
+  return 0
+}
+
+# A burst of saves produces one event per file. Rewriting the file for every one
+# of them would be pointless churn, so a write happens only when the state or
+# the pending set actually changed — except for a retry, whose nextRetry moves
+# on each attempt and is the whole content of that state.
+watcher_set_state() {
+  local state="$1" next_retry="${2:-}" sig
+  sig="$(pending_signature)"
+  if [[ -z "$next_retry" && "$state" == "$WATCHER_STATE" && "$sig" == "$WATCHER_PENDING_SIG" ]]; then
+    return 0
+  fi
+  WATCHER_STATE="$state"
+  WATCHER_PENDING_SIG="$sig"
+  watcher_write "$state" "$next_retry"
+}
 
 # --- The folder table -------------------------------------------------------
 # gdrive-sync --list-paths prints one line per folder: path, tab, --only= value.
@@ -112,6 +177,7 @@ mark_dirty() {
   # A new event is new activity: go back to debouncing rather than waiting out
   # the retry's longer interval.
   RETRY_PENDING=0
+  watcher_set_state pending
 }
 
 # --- Draining ---------------------------------------------------------------
@@ -138,16 +204,30 @@ handle_rc() {
   esac
 }
 
-# The child's output does not leak in here: it writes to its own log as before,
-# and the watcher records only the exit code (§7).
+# The child's output is passed through to the journal, not discarded. The
+# original rule (§7) sent it to /dev/null because gdrive-sync also wrote
+# $LOG_DIR/<date>.log, so nothing was lost by keeping the watcher's own output
+# clean. That log file is gone — everything goes to the journal now — and
+# discarding the child would leave a watcher-triggered sync with no record but
+# its exit code, while the same run started by the timer is fully logged. The
+# watcher still adds only the exit code of its own; the detail below it is the
+# child's.
 drain() {
   local only rc
+  watcher_set_state syncing
   for only in "${!DIRTY[@]}"; do
-    "$SYNC_BIN" "--only=$only" >/dev/null 2>&1
+    # GDRIVE_TRIGGER labels the run in status.json. The assignment is a prefix on
+    # an external command, so it lives exactly as long as that command.
+    GDRIVE_TRIGGER=watch "$SYNC_BIN" "--only=$only"
     rc=$?
     handle_rc "$only" "$rc"
   done
   if (( ${#DIRTY[@]} > 0 )); then RETRY_PENDING=1; else RETRY_PENDING=0; fi
+  if (( RETRY_PENDING )); then
+    watcher_set_state retry "$(date --iso-8601=seconds -d "+$RETRY_SEC seconds")"
+  else
+    watcher_set_state watching
+  fi
   return 0
 }
 
@@ -240,7 +320,11 @@ HELP
     --format '%w%f' --exclude "$EXCLUDE_RE" \
     "${watch_paths[@]}")
   local inotify_pid=$!
-  trap 'kill "$inotify_pid" 2>/dev/null' EXIT INT TERM
+  # "stopped" belongs in the same trap as killing inotifywait: both are what
+  # "this watcher is no longer running" means, and the ordinary way out of here
+  # is a deliberate exit 0 when folders.txt changes, not a signal.
+  trap 'kill "$inotify_pid" 2>/dev/null; watcher_set_state stopped' EXIT INT TERM
+  watcher_set_state watching
 
   local path rc
   while :; do
