@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Deterministic rclone double. Tests opt into responses through environment
+# variables; no test may reach the user's real remote or rclone configuration.
+set -uo pipefail
+
+if [[ -n "${RCLONE_CALLS:-}" ]]; then
+  {
+    printf 'command=%s\n' "${1:-}"
+    printf 'arg=%s\n' "$@"
+  } >> "$RCLONE_CALLS"
+fi
+
+case "${1:-}" in
+  lsjson)
+    if [[ "${2:-}" == *,root_folder_id=* ]]; then
+      printf '%s\n' "${RCLONE_LSJSON_CHILD:-${RCLONE_LSJSON:-[]}}"
+    else
+      printf '%s\n' "${RCLONE_LSJSON_ROOT:-${RCLONE_LSJSON:-[]}}"
+    fi
+    exit "${RCLONE_LSJSON_RC:-0}"
+    ;;
+  lsd)
+    printf '%s' "${RCLONE_LSD_OUTPUT:-          -1 2026-01-01 00:00:00        -1 Documents}"
+    exit "${RCLONE_LSD_RC:-0}"
+    ;;
+  lsf)
+    printf '%s' "${RCLONE_LSF_OUTPUT:-remote-entry}"
+    exit "${RCLONE_LSF_RC:-0}"
+    ;;
+  bisync)
+    exit "${RCLONE_BISYNC_RC:-0}"
+    ;;
+  *)
+    printf 'unexpected fake rclone command: %s\n' "${1:-<none>}" >&2
+    exit 97
+    ;;
+esac

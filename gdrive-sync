@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+# Bidirectional rclone bisync for selected Google Drive folders.
+# Folder list: $GDRIVE_CONF_DIR/folders.txt, by default
+# ~/.config/rclone-gdrive-sync/folders.txt. Settings live in the same directory
+# in config.env (optional).
+#
+# A folder is written into the list as a name, but the remote side is addressed
+# by its Drive folder ID: on the first run the name is resolved to an ID and the
+# ID is pinned in a state file. Renaming or moving the folder in Drive then does
+# not break syncing, and — more to the point — does not change the address
+# bisync works with, so there is nothing to abort on and nothing to diagnose.
+set -uo pipefail
+
+VERSION="0.1.0"
+
+# --- Settings ---------------------------------------------------------------
+# The config file is optional. Without it the behaviour is the same as before it
+# existed. The directory location comes from the environment (GDRIVE_CONF_DIR),
+# because it has to be known before the file can be read; setting
+# GDRIVE_CONF_DIR inside the file therefore has no effect.
+#
+# Note: source runs the file as bash code. It is the user's own config file, but
+# keep its permissions to yourself.
+CONF_DIR="${GDRIVE_CONF_DIR:-$HOME/.config/rclone-gdrive-sync}"
+CONFIG_FILE="$CONF_DIR/config.env"
+# shellcheck source=/dev/null
+[[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+REMOTE="${GDRIVE_REMOTE:-GoogleDrive}"
+REMOTE="${REMOTE%:}"          # the spelling "GoogleDrive:" is allowed
+LOCAL_ROOT="${GDRIVE_LOCAL:-$HOME/GoogleDrive}"
+FOLDERS="${GDRIVE_FOLDERS:-$CONF_DIR/folders.txt}"
+FILTER="${GDRIVE_FILTER:-$CONF_DIR/filter.txt}"
+STATE_DIR="${GDRIVE_STATE_DIR:-$HOME/.local/state/rclone-gdrive-sync}"
+INIT_DIR="$STATE_DIR/initialized"
+LOG_DIR="$STATE_DIR/logs"
+LOCK="$STATE_DIR/lock"
+
+DRY_RUN=0
+FORCE_RESYNC=0
+ALLOW_EMPTY=0
+ONLY=""
+ACTION="sync"
+REPIN=""
+STATE_KEYS_REQUIRED=0
+for arg in "$@"; do
+  case "$arg" in
+    -n|--dry-run)  DRY_RUN=1 ;;
+    --resync)      FORCE_RESYNC=1 ;;
+    --only=*)      ONLY="${arg#--only=}" ;;
+    --status)      ACTION="status" ;;
+    --list-paths)  ACTION="list-paths" ;;
+    --repin)       ACTION="repin"; REPIN="" ;;
+    --repin=*)     ACTION="repin"; REPIN="${arg#--repin=}" ;;
+    --allow-empty-remote) ALLOW_EMPTY=1 ;;
+    -V|--version)  printf 'gdrive-sync %s\n' "$VERSION"; exit 0 ;;
+    -h|--help)
+      cat <<HELP
+gdrive-sync [options]
+
+  -n, --dry-run     Preview operations without changing synced data or state
+      --resync      Force bisync reinitialisation (--resync) for all folders
+      --only=NAME   Process only this folder
+      --status      List folders, pinned IDs and their current name in Drive
+      --list-paths  Print the folder table: local path, tab, --only= value
+                      (no network, no lock; gdrive-watch reads this)
+      --repin[=NAME]  Resolve the folder ID again from the name
+                      (requires reinitialisation next, done automatically)
+      --allow-empty-remote
+                    Allow the run even if the remote folder is empty and the
+                    local one is not. Use only when you emptied the folder in
+                    Drive yourself.
+  -h, --help        This help
+  -V, --version     Print the version and exit
+
+Settings:    $CONFIG_FILE (optional)
+Folder list: $FOLDERS
+Logs:        $LOG_DIR/
+HELP
+      exit 0 ;;
+    *) echo "Unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+# Legacy state files replaced slashes and spaces with underscores, which is not
+# one-to-one. Keep that spelling only for safe migration of existing markers.
+legacy_slug() { local s="${1//\//_}"; printf '%s' "${s// /_}"; }
+
+# Fixed-length state filenames derived from the complete logical identity.
+state_hash() { printf '%s' "$1" | sha256sum | sed 's/[[:space:]].*//'; }
+
+# --- Line parsing -----------------------------------------------------------
+# A line is either a path from the root of Drive:
+#     Projects/2026
+# or a folder ID followed by the name of the local directory:
+#     id:0BwyG7PLuwLCCWTR0UWJVc2kzQ0k  Archive
+# spec=the line as written, path=remote path (empty on id: lines),
+# fixed_id=the ID given on the line (empty on path lines), lname=local name,
+# key=state file name, legacy_key=the pre-v2 state file name.
+parse_line() {
+  spec="$1"; path=""; fixed_id=""; lname=""; key=""; legacy_key=""
+  if [[ "$spec" == id:* ]]; then
+    local rest="${spec#id:}"
+    fixed_id="${rest%%[[:space:]]*}"
+    lname="${rest#"$fixed_id"}"
+    lname="${lname#"${lname%%[![:space:]]*}"}"
+    if [[ -z "$fixed_id" || -z "$lname" ]]; then
+      echo "Invalid line (an id: line needs a local name): $spec" >&2
+      return 1
+    fi
+    legacy_key="id_$(legacy_slug "$lname")"
+    (( STATE_KEYS_REQUIRED )) && key="id_$(state_hash "$lname")"
+  else
+    path="$spec"; lname="$spec"
+    legacy_key="$(legacy_slug "$path")"
+    (( STATE_KEYS_REQUIRED )) && key="path_$(state_hash "$path")"
+  fi
+  return 0
+}
+
+# --- Reading the folder list ------------------------------------------------
+# Fills the LINES array. Its own function, because --list-paths needs it before
+# the lock and the other actions after it; parsing stays in one place.
+load_lines() {
+  [[ -f "$FOLDERS" ]] || { echo "Folder list not found: $FOLDERS" >&2; exit 1; }
+  mapfile -t LINES < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$FOLDERS" | grep -v '^$')
+  if (( ${#LINES[@]} == 0 )); then
+    echo "Folder list is empty — add folders to $FOLDERS" >&2
+    exit 1
+  fi
+}
+
+# Refuse two entries that address the same local directory. This also catches a
+# path entry and an id: entry that would otherwise run two bisync histories over
+# one tree.
+validate_lines() {
+  local spec_line local_path previous i
+  local -a seen_paths=() seen_specs=()
+  for spec_line in "${LINES[@]}"; do
+    parse_line "$spec_line" || continue
+    local_path="$LOCAL_ROOT/$lname"
+    for i in "${!seen_paths[@]}"; do
+      if [[ "${seen_paths[$i]}" == "$local_path" ]]; then
+        previous="${seen_specs[$i]}"
+        echo "Duplicate local folder '$local_path' in $FOLDERS" >&2
+        echo "  first: $previous" >&2
+        echo "  again: $spec_line" >&2
+        return 1
+      fi
+    done
+    seen_paths+=("$local_path")
+    seen_specs+=("$spec_line")
+  done
+}
+
+# --- --list-paths -----------------------------------------------------------
+# A plain read of folders.txt for gdrive-watch: no network, no state files, no
+# lock. Handled before the jq check, because no ID is resolved — a missing jq
+# must not stop the watcher from starting.
+#
+# An invalid line is reported on stderr but does not break the output: a
+# non-zero return value would make gdrive-watch refuse to watch any folder at
+# all, so one broken line would end watching for everything. Zero lines is not
+# a table at all, and that is an error.
+if [[ "$ACTION" == "list-paths" ]]; then
+  load_lines
+  validate_lines || exit 1
+  printed=0
+  for spec_line in "${LINES[@]}"; do
+    parse_line "$spec_line" || continue
+    printf '%s\t%s\n' "$LOCAL_ROOT/$lname" "$lname"
+    printed=1
+  done
+  (( printed )) || { echo "No line in the folder list is valid: $FOLDERS" >&2; exit 1; }
+  exit 0
+fi
+
+command -v jq >/dev/null || { echo "jq is missing — needed to resolve IDs" >&2; exit 1; }
+command -v sha256sum >/dev/null || { echo "sha256sum is missing — needed for state keys" >&2; exit 1; }
+STATE_KEYS_REQUIRED=1
+
+# Real runs create and lock persistent state. A dry-run takes the existing lock
+# read-only when one exists, but does not create state merely to preview work.
+if (( ! DRY_RUN )); then
+  mkdir -p "$INIT_DIR" "$LOG_DIR" "$LOCAL_ROOT"
+  exec 9>"$LOCK"
+elif [[ -r "$LOCK" ]]; then
+  exec 9<"$LOCK"
+fi
+if { (( ! DRY_RUN )) || [[ -r "$LOCK" ]]; } && ! flock -n 9; then
+  # 75 = EX_TEMPFAIL: "try again later". For the timer an overlapping run is not
+  # an error (SuccessExitStatus=75), but gdrive-watch needs to tell it apart
+  # from a successful run: otherwise a missed change would be recorded as synced.
+  echo "gdrive-sync is already running, skipping." >&2
+  exit 75
+fi
+
+load_lines
+validate_lines || exit 1
+
+LOG="$LOG_DIR/$(date +%Y-%m-%d).log"
+if (( DRY_RUN )); then
+  log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
+else
+  log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
+fi
+
+COMMON=(
+  --drive-export-formats url
+  --drive-skip-dangling-shortcuts
+  --filter-from "$FILTER"
+  --create-empty-src-dirs
+  --transfers 8
+  --checkers 16
+  --tpslimit 10
+  --retries 3
+  --low-level-retries 10
+)
+(( DRY_RUN )) || COMMON+=(--log-file "$LOG" --log-level INFO)
+BISYNC_OPTS=(
+  --conflict-resolve newer
+  --conflict-loser num
+  --conflict-suffix conflict
+  --resilient
+  --recover
+  --max-lock 15m
+  # Quoted for shellcheck's benefit (SC2054): the comma belongs to rclone's
+  # own value syntax, it does not separate array elements.
+  --compare 'size,modtime'
+  --modify-window 1s
+)
+(( DRY_RUN )) && BISYNC_OPTS+=(--dry-run)
+
+# --- State file -------------------------------------------------------------
+# initialized/<key> holds key=value lines: id, name, path, pinned.
+# An empty file = an old name-based initialisation that needs pinning.
+marker_get() {
+  local file="$1" field="$2"
+  [[ -s "$file" ]] || return 1
+  local val
+  val="$(sed -n "s/^$field=//p" "$file" | head -1)"
+  [[ -n "$val" ]] || return 1
+  printf '%s' "$val"
+}
+
+marker_write() {
+  local file="$1" id="$2" name="$3" path="$4" pending="${5:-0}"
+  local tmp="${file}.tmp.$$"
+  {
+    printf 'id=%s\n' "$id"
+    printf 'name=%s\n' "$name"
+    printf 'path=%s\n' "$path"
+    printf 'pinned=%s\n' "$(date --iso-8601=seconds)"
+    (( pending )) && printf 'resync=1\n'
+  } > "$tmp" || return 1
+  mv -- "$tmp" "$file"
+}
+
+marker_matches_identity() {
+  local file="$1" stored_name stored_path
+  [[ -s "$file" ]] || return 1
+  stored_name="$(sed -n 's/^name=//p' "$file" | head -1)"
+  stored_path="$(sed -n 's/^path=//p' "$file" | head -1)"
+  if [[ -n "$fixed_id" ]]; then
+    [[ "$stored_name" == "$lname" && -z "$stored_path" ]]
+  else
+    [[ "$stored_path" == "$path" ]]
+  fi
+}
+
+marker_for_read() {
+  local current="$INIT_DIR/$key" legacy="$INIT_DIR/$legacy_key"
+  if marker_matches_identity "$current"; then
+    printf '%s' "$current"
+  elif marker_matches_identity "$legacy"; then
+    printf '%s' "$legacy"
+  else
+    return 1
+  fi
+}
+
+prepare_marker() {
+  marker="$INIT_DIR/$key"
+  local legacy="$INIT_DIR/$legacy_key"
+  if [[ -e "$marker" ]]; then
+    if ! marker_matches_identity "$marker"; then
+      log "==> $lname: ERROR — state marker does not match this folder, refusing to sync"
+      return 1
+    fi
+    return 0
+  fi
+  if [[ -s "$legacy" ]]; then
+    if marker_matches_identity "$legacy"; then
+      if (( DRY_RUN )); then
+        marker="$legacy"
+      elif ! cp -- "$legacy" "$marker"; then
+        log "==> $lname: ERROR — could not migrate legacy state marker"
+        return 1
+      fi
+    else
+      log "==> $lname: ignoring a colliding legacy state marker"
+    fi
+  fi
+}
+
+# --- Resolving the ID -------------------------------------------------------
+remote_for() { printf '%s,root_folder_id=%s:' "$REMOTE" "$1"; }
+
+# Resolve every path component by ID. Drive permits duplicate names, so a name
+# is safe to pin only when it identifies exactly one distinct target.
+resolve_id() {
+  local requested="$1" component json matches address current_id=""
+  local -a components ids
+  IFS='/' read -r -a components <<< "$requested"
+  (( ${#components[@]} > 0 )) || return 1
+  for component in "${components[@]}"; do
+    [[ -n "$component" ]] || return 1
+    if [[ -n "$current_id" ]]; then address="$(remote_for "$current_id")"; else address="$REMOTE:"; fi
+    json="$(rclone lsjson "$address" --dirs-only --drive-skip-dangling-shortcuts 2>/dev/null)" || return 1
+    matches="$(printf '%s' "$json" | jq -r --arg n "$component" \
+      '[.[] | select(.Name == $n) | (.ID | sub(".*\\t"; ""))] | unique[]')" || return 1
+    mapfile -t ids <<< "$matches"
+    [[ -n "$matches" && ${#ids[@]} -eq 1 ]] || {
+      [[ -n "$matches" ]] && return 2
+      return 1
+    }
+    current_id="${ids[0]}"
+  done
+  printf '%s' "$current_id"
+}
+
+# The current name in Drive for a pinned ID, from the parent folder listing.
+current_name() {
+  local path="$1" id="$2" parent json
+  if [[ "$path" == */* ]]; then parent="${path%/*}"; else parent=""; fi
+  json="$(rclone lsjson "$REMOTE:$parent" --dirs-only --drive-skip-dangling-shortcuts 2>/dev/null)" || return 1
+  printf '%s' "$json" \
+    | jq -r --arg id "$id" '.[] | select((.ID | sub(".*\t";"")) == $id) | .Name' | head -1
+}
+
+selected() {
+  [[ -z "$ONLY" ]] && return 0
+  [[ "$ONLY" == "$spec" || "$ONLY" == "$lname" ]]
+}
+
+# --- --status ---------------------------------------------------------------
+if [[ "$ACTION" == "status" ]]; then
+  for spec_line in "${LINES[@]}"; do
+    parse_line "$spec_line" || { rc_total=1; continue; }
+    selected || continue
+    marker="$(marker_for_read)" || marker="$INIT_DIR/$key"
+    id="$(marker_get "$marker" id)" || id=""
+    if [[ -z "$id" ]]; then
+      id="$fixed_id"
+      [[ -n "$id" ]] && pin_state="given on the line" || pin_state="NOT PINNED (will be initialised on the next run)"
+    else
+      pin_state="pinned $(marker_get "$marker" pinned || echo '?')"
+    fi
+    printf '%s\n' "$spec_line"
+    printf '  local     : %s\n' "$LOCAL_ROOT/$lname"
+    printf '  ID        : %s (%s)\n' "${id:-–}" "$pin_state"
+    if [[ -n "$id" ]]; then
+      if rclone lsf --max-depth 1 "$(remote_for "$id")" >/dev/null 2>&1; then
+        if [[ -n "$path" ]]; then
+          cur="$(current_name "$path" "$id")"
+          if [[ -z "$cur" ]]; then
+            printf '  in Drive  : not found in parent folder %s — moved?\n' "${path%/*}"
+          elif [[ "$cur" != "${path##*/}" ]]; then
+            printf '  in Drive  : renamed: %s\n' "$cur"
+          else
+            printf '  in Drive  : %s\n' "$cur"
+          fi
+        else
+          printf '  in Drive  : ID matches\n'
+        fi
+      else
+        printf '  in Drive  : ID DOES NOT RESOLVE — deleted or permissions changed\n'
+      fi
+    fi
+    printf '\n'
+  done
+  exit 0
+fi
+
+# --- Main loop --------------------------------------------------------------
+rc_total=0
+
+for spec_line in "${LINES[@]}"; do
+  parse_line "$spec_line" || { rc_total=1; continue; }
+  selected || continue
+
+  marker="$INIT_DIR/$key"
+  local_path="$LOCAL_ROOT/$lname"
+  (( DRY_RUN )) || mkdir -p "$local_path"
+
+  if ! prepare_marker; then
+    rc_total=1
+    continue
+  fi
+
+  need_resync=0
+  (( FORCE_RESYNC )) && need_resync=1
+
+  id="$(marker_get "$marker" id)" || id=""
+  marker_get "$marker" resync >/dev/null && need_resync=1
+
+  # Pinning: an ID given on the line always wins, otherwise it is resolved from
+  # the name.
+  if [[ "$ACTION" == "repin" ]]; then
+    if [[ -n "$REPIN" && "$REPIN" != "$spec" && "$REPIN" != "$lname" ]]; then continue; fi
+    [[ -n "$path" ]] || { log "==> $lname: --repin does not apply to id: lines"; continue; }
+    id=""
+  fi
+
+  if [[ -n "$fixed_id" ]]; then
+    if [[ "$id" != "$fixed_id" ]]; then
+      id="$fixed_id"; need_resync=1
+      if (( ! DRY_RUN )) && ! marker_write "$marker" "$id" "$lname" "" 1; then
+        log "==> $lname: ERROR — could not persist pending initialization"
+        rc_total=1
+        continue
+      fi
+      log "==> $lname: ID taken from the line, reinitialising"
+    fi
+  elif [[ -z "$id" ]]; then
+    log "==> $lname: resolving the folder ID from Drive"
+    id="$(resolve_id "$path")"
+    resolve_rc=$?
+    if (( resolve_rc != 0 )); then
+      if (( resolve_rc == 2 )); then
+        log "    $lname: ERROR — folder path '$path' is ambiguous in Drive; use an id: entry"
+      else
+        log "    $lname: ERROR — folder not found in Drive at path '$path'"
+      fi
+      rc_total=1
+      continue
+    fi
+    # Moving from a name-based initialisation changes the remote address, so
+    # bisync's comparison listings have to be rebuilt.
+    need_resync=1
+    if (( ! DRY_RUN )) && ! marker_write "$marker" "$id" "${path##*/}" "$path" 1; then
+      log "==> $lname: ERROR — could not persist pending initialization"
+      rc_total=1
+      continue
+    fi
+    log "    $lname: ID $id"
+  fi
+
+  if [[ "$ACTION" == "repin" ]]; then
+    log "    $lname: repinned, the next run will initialise"
+    continue
+  fi
+
+  remote="$(remote_for "$id")"
+
+  # Safety gate: the ID has to resolve, and the remote folder must not be empty
+  # while the local one is not. Both are symptoms of the same thing — the folder
+  # was deleted, is in the trash, or permissions changed. bisync would abort on
+  # its own here; the point of checking first is a named reason for the one
+  # folder affected, while the others keep syncing.
+  if ! remote_head="$(rclone lsf --max-depth 1 "$remote" 2>/dev/null)"; then
+    log "==> $lname: ERROR — ID $id does not resolve in Drive, skipping (no bisync)"
+    rc_total=1
+    continue
+  fi
+  if (( ! ALLOW_EMPTY )) && [[ -z "$remote_head" ]] \
+     && [[ -n "$(ls -A "$local_path" 2>/dev/null)" ]]; then
+    log "==> $lname: ERROR — remote folder is empty but local is not. Skipping."
+    log "    Check Drive. If you emptied the folder on purpose: --allow-empty-remote"
+    rc_total=1
+    continue
+  fi
+
+  opts=("${BISYNC_OPTS[@]}")
+  if (( need_resync )) || [[ ! -e "$marker" ]]; then
+    log "==> $lname: initialising (--resync)"
+    opts+=(--resync --resync-mode newer)
+  else
+    log "==> $lname: bisync"
+  fi
+
+  if rclone bisync "$remote" "$local_path" "${opts[@]}" "${COMMON[@]}"; then
+    log "    $lname: OK"
+    if (( ! DRY_RUN )); then
+      if [[ ! -s "$marker" ]] && ! marker_write "$marker" "$id" "$lname" "$path" 0; then
+        log "    $lname: ERROR — sync succeeded but state could not be persisted"
+        rc_total=1
+        continue
+      fi
+      if ! sed -i '/^resync=1$/d' "$marker"; then
+        log "    $lname: ERROR — sync succeeded but pending initialization could not be cleared"
+        rc_total=1
+      fi
+    fi
+  else
+    rc=$?
+    rc_total=1
+    log "    $lname: ERROR (rclone exit $rc) — see $LOG"
+  fi
+done
+
+# Clean up logs older than 30 days after a real run only.
+(( DRY_RUN )) || find "$LOG_DIR" -name '*.log' -mtime +30 -delete 2>/dev/null
+
+exit $rc_total

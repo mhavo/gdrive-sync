@@ -1,0 +1,9 @@
+# Shared exclude rules (rclone filter syntax)
+- .DS_Store
+- ._*
+- .Spotlight-V100/**
+- .Trashes/**
+- Thumbs.db
+- desktop.ini
+- ~$*
+- .~lock.*#

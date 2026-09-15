@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Opens a Windows-style .url shortcut (rclone's gdocs export) in a browser.
+set -euo pipefail
+
+[[ $# -ge 1 ]] || { echo "Usage: open-url-shortcut FILE.url" >&2; exit 2; }
+
+file="$1"
+# Also accepts a file:// URI, which Nautilus may hand over
+if [[ "$file" == file://* ]]; then
+  file="${file#file://}"
+  file="$(printf '%b' "${file//%/\\x}")"
+fi
+
+[[ -r "$file" ]] || { echo "Cannot read file: $file" >&2; exit 1; }
+
+# The URL= line of the [InternetShortcut] section, CR stripped, first match only
+url="$(sed -n 's/\r$//; s/^URL=//p' "$file" | head -1)"
+
+if [[ -z "$url" ]]; then
+  echo "No URL= line found in file: $file" >&2
+  exit 1
+fi
+
+case "$url" in
+  http://*|https://*) ;;
+  *) echo "URL scheme not allowed: $url" >&2; exit 1 ;;
+esac
+
+exec xdg-open "$url"

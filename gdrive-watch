@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# Listens for local changes with inotify and runs gdrive-sync for the folder
+# that actually changed. A local save reaches Drive in seconds rather than in
+# 15 minutes.
+#
+# The watcher does not replace the timer. Drive's side cannot be watched, so the
+# 15-minute timer stays as it is and doubles as the safety net whenever the
+# watcher is down or has missed an event.
+#
+# The watcher does not parse folders.txt itself; it asks for a ready-made table
+# with gdrive-sync --list-paths. Line parsing stays in one place.
+#
+# All output goes to stdout and stderr, which under the systemd unit is the
+# journal. The watcher opens no log file of its own; the gdrive-sync runs it
+# triggers write to their own log as before.
+set -uo pipefail
+
+VERSION="0.1.0"
+
+# --- Settings ---------------------------------------------------------------
+# The same block as in gdrive-sync: config directory from the environment, the
+# config file optional.
+CONF_DIR="${GDRIVE_CONF_DIR:-$HOME/.config/rclone-gdrive-sync}"
+CONFIG_FILE="$CONF_DIR/config.env"
+# shellcheck source=/dev/null
+[[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+FOLDERS="${GDRIVE_FOLDERS:-$CONF_DIR/folders.txt}"
+DEBOUNCE_SEC="${GDRIVE_DEBOUNCE_SEC:-5}"
+RETRY_SEC="${GDRIVE_RETRY_SEC:-30}"
+SYNC_BIN="${GDRIVE_SYNC_BIN:-gdrive-sync}"
+
+# inotify's own exclude pattern (POSIX ERE). A different thing from rclone's
+# filter.txt, whose syntax is another one — which is why they are not shared as
+# a single file.
+EXCLUDE_RE='(~$|\.swp$|\.tmp$|\.partial$|\.crdownload$|\.conflict[0-9]*$)'
+
+# The folder table as two parallel arrays, never as one string: a folder name
+# contains spaces more often than not (R12).
+DIRS=()
+ONLYS=()
+
+# The set of dirty folders: the key is the --only= value, presence is the only
+# meaning. An associative array, not a space-separated string.
+declare -A DIRTY=()
+
+# 1 = the previous drain hit the lock and a retry is pending in the set.
+RETRY_PENDING=0
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+
+# --- The folder table -------------------------------------------------------
+# gdrive-sync --list-paths prints one line per folder: path, tab, --only= value.
+# Empty output or a non-zero return value is a startup error: the watcher never
+# runs on a partial table (R10).
+build_table() {
+  local table rc dir only
+  table="$("$SYNC_BIN" --list-paths)"
+  rc=$?
+  if (( rc != 0 )); then
+    warn "gdrive-sync --list-paths failed (exit $rc) — not starting the watcher"
+    return 1
+  fi
+  if [[ -z "$table" ]]; then
+    warn "gdrive-sync --list-paths printed nothing (empty folder table) — not starting the watcher"
+    return 1
+  fi
+
+  DIRS=()
+  ONLYS=()
+  # IFS set to tab for the duration of this read only: this way spaces survive
+  # in both fields. -r preserves backslashes and trailing spaces.
+  while IFS=$'\t' read -r dir only; do
+    [[ -n "$dir" && -n "$only" ]] || continue
+    DIRS+=("$dir")
+    ONLYS+=("$only")
+  done <<< "$table"
+
+  (( ${#DIRS[@]} > 0 ))
+}
+
+# --- Path -> folder ---------------------------------------------------------
+# The longest match wins: if both Projects and Projects/2026 are on the list, an
+# event below the latter belongs to the latter. The comparison is made on a
+# directory boundary, so Tickler does not match Tickler-old.
+#
+# The right-hand side is quoted: unquoted, [[ == ]] reads it as a pattern, and a
+# folder named "Photos [2026]" would match wrongly as a character class, or not
+# at all. The trailing /* is left unquoted, because that one is meant to be a
+# pattern.
+folder_for_path() {
+  local path="$1" best="" bestlen=-1 found=0 i dir
+  for i in "${!DIRS[@]}"; do
+    dir="${DIRS[$i]}"
+    if [[ "$path" == "$dir" || "$path" == "$dir"/* ]]; then
+      if (( ${#dir} > bestlen )); then
+        bestlen=${#dir}
+        best="${ONLYS[$i]}"
+        found=1
+      fi
+    fi
+  done
+  (( found )) || return 1
+  printf '%s\n' "$best"
+}
+
+mark_dirty() {
+  local only
+  only="$(folder_for_path "$1")" || return 0
+  DIRTY["$only"]=1
+  # A new event is new activity: go back to debouncing rather than waiting out
+  # the retry's longer interval.
+  RETRY_PENDING=0
+}
+
+# --- Draining ---------------------------------------------------------------
+# The exit code decides:
+#   0     synced              -> out of the set
+#   75    a run was already going -> stays in the set, retried
+#   other the sync failed     -> out of the set and into the log
+# Other errors are dropped, because a permanently broken folder would otherwise
+# keep retrying forever; the timer will try it in 15 minutes anyway.
+handle_rc() {
+  local only="$1" rc="$2"
+  case "$rc" in
+    0)
+      unset -v 'DIRTY[$only]'
+      log "$only: synced"
+      ;;
+    75)
+      log "$only: gdrive-sync was already running (75) — retrying in ${RETRY_SEC}s"
+      ;;
+    *)
+      unset -v 'DIRTY[$only]'
+      warn "$only: gdrive-sync failed (exit $rc) — the timer will try again"
+      ;;
+  esac
+}
+
+# The child's output does not leak in here: it writes to its own log as before,
+# and the watcher records only the exit code (§7).
+drain() {
+  local only rc
+  for only in "${!DIRTY[@]}"; do
+    "$SYNC_BIN" "--only=$only" >/dev/null 2>&1
+    rc=$?
+    handle_rc "$only" "$rc"
+  done
+  if (( ${#DIRTY[@]} > 0 )); then RETRY_PENDING=1; else RETRY_PENDING=0; fi
+  return 0
+}
+
+# The wait itself is the signal: a timeout means the changes have settled. A set
+# waiting on a retry must not be left waiting for a new event that may never
+# come.
+next_wait() {
+  if (( RETRY_PENDING )); then printf '%s\n' "$RETRY_SEC"; else printf '%s\n' "$DEBOUNCE_SEC"; fi
+}
+
+# --- folders.txt ------------------------------------------------------------
+# Only folders.txt triggers a reread: it is the one file in the config directory
+# whose contents the watcher holds in memory. config.env and filter.txt are read
+# again on every gdrive-sync run.
+is_folders_event() { [[ "$1" == "$FOLDERS" ]]; }
+
+# --- Main loop --------------------------------------------------------------
+main() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help)
+        cat <<HELP
+gdrive-watch [options]
+
+Watches the synced folders with inotify and runs gdrive-sync for the folder
+that changed. Takes no arguments in normal use; settings come from the
+environment and from the config file.
+
+  -h, --help        This help
+  -V, --version     Print the version and exit
+
+Settings:    $CONFIG_FILE (optional)
+Folder list: $FOLDERS
+HELP
+        exit 0 ;;
+      -V|--version) printf 'gdrive-watch %s\n' "$VERSION"; exit 0 ;;
+      *) warn "Unknown option: $arg"; exit 2 ;;
+    esac
+  done
+
+  command -v inotifywait >/dev/null || {
+    warn "inotifywait is missing — install inotify-tools"
+    exit 1
+  }
+
+  build_table || exit 1
+
+  log "folder table (${#DIRS[@]} folders):"
+  local i
+  for i in "${!DIRS[@]}"; do
+    log "  ${DIRS[$i]}  ->  --only=${ONLYS[$i]}"
+  done
+
+  # A missing directory is skipped with a warning: a single non-existent path
+  # would make inotifywait exit immediately, leaving Restart=always spinning and
+  # no folder watched at all. The next gdrive-sync run creates the directory and
+  # it is picked up when the watcher next starts.
+  local -a watch_paths=()
+  local dir
+  for dir in "${DIRS[@]}"; do
+    if [[ -d "$dir" ]]; then
+      watch_paths+=("$dir")
+    else
+      warn "directory does not exist, skipping: $dir"
+    fi
+  done
+
+  # folders.txt is watched through its parent directory, not through the file's
+  # inode (R7): an editor saves by renaming a temporary file over it, which
+  # leaves a watch pinned to the inode hanging on the replaced inode, and no
+  # event ever arrives again.
+  local folders_dir
+  folders_dir="$(dirname "$FOLDERS")"
+  if [[ -d "$folders_dir" ]]; then
+    watch_paths+=("$folders_dir")
+  else
+    warn "the folder list's directory does not exist, skipping: $folders_dir"
+  fi
+
+  if (( ${#watch_paths[@]} == 0 )); then
+    warn "no paths to watch — not starting the watcher"
+    exit 1
+  fi
+
+  # One inotifywait, one pipe, one reader (R9). Error output and inotifywait's
+  # own warnings (e.g. the watch quota) go straight to the journal.
+  exec 3< <(inotifywait -m -r \
+    -e close_write -e create -e delete -e moved_to -e moved_from \
+    --format '%w%f' --exclude "$EXCLUDE_RE" \
+    "${watch_paths[@]}")
+  local inotify_pid=$!
+  trap 'kill "$inotify_pid" 2>/dev/null' EXIT INT TERM
+
+  local path rc
+  while :; do
+    IFS= read -r -t "$(next_wait)" -u 3 path
+    rc=$?
+    if (( rc == 0 )); then
+      if is_folders_event "$path"; then
+        log "$FOLDERS changed — exiting, systemd restarts and rereads the table"
+        exit 0
+      fi
+      mark_dirty "$path"
+    elif (( rc > 128 )); then
+      (( ${#DIRTY[@]} > 0 )) && drain
+    else
+      warn "inotifywait ended — exiting, systemd restarts"
+      exit 1
+    fi
+  done
+}
+
+# The tests source this file and call individual functions, so the main loop
+# starts only when it is run directly.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

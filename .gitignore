@@ -1,0 +1,18 @@
+__pycache__/
+*.log
+
+# AI-assisted development artifacts: working notes, specs, handoffs, agent and
+# skill definitions written while developing this code. Useful locally, noise
+# in a published repository.
+.agents/
+.claude/
+.muuli-workflows/
+docs/
+handoff.md
+*.handoff.md
+skills-lock.json
+CLAUDE.md
+GEMINI.md
+
+# AGENTS.md is not in that list on purpose: it is written for whoever installs
+# this, agent or human, and is part of the published repository.

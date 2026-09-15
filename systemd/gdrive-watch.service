@@ -1,0 +1,26 @@
+[Unit]
+Description=Watch for local changes and sync them to Drive right away
+After=network-online.target
+Wants=network-online.target
+
+# Restarting is this unit's normal operation, not an error path: a change to
+# folders.txt ends the watcher with code 0 precisely so that systemd rereads the
+# folder table, and a startup error exits deliberately with a non-zero code.
+# systemd's default limit (5 starts in 10 seconds) would leave the unit
+# permanently failed in either case — a few quick saves of folders.txt would be
+# enough, or a folders.txt fixed a second later. Silently watching nothing is the
+# one failure mode this must not produce, so the limit is removed and RestartSec
+# is left as the only brake.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=GDRIVE_SYNC_BIN=%h/.local/bin/gdrive-sync
+ExecStart=%h/.local/bin/gdrive-watch
+Restart=always
+RestartSec=2
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+# Google Drive folders to sync bidirectionally into ~/GoogleDrive
+#
+# One folder per line, path from the root of Drive. Subfolders are fine:
+#   Projects/2026
+# Lines starting with # are skipped.
+#
+# On the first run the folder name is resolved to a Drive folder ID, which is
+# pinned in a state file. After that, renaming the folder in Drive does not
+# affect syncing. To give the ID directly, write the line as
+#   id:<folder ID>  <name of the local directory>
+# Current IDs and Drive names: gdrive-sync --status
+
+# PUT YOUR CHOSEN FOLDERS HERE, for example:
+#Documents
+#Projects/2026
+#id:1Ry8oqCD5s-CG4j2Cbypr6EEZfiRZHXsZ  Archive

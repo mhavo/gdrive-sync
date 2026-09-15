@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Open link in browser
+Comment=Opens the target of a .url shortcut in the default browser
+Exec=open-url-shortcut %f
+Icon=text-html
+Terminal=false
+NoDisplay=true
+MimeType=application/x-mswinurl;

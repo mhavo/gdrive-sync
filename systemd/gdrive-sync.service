@@ -1,0 +1,13 @@
+[Unit]
+Description=Bidirectional rclone bisync with Google Drive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/gdrive-sync
+# 75 = an overlapping run (gdrive-watch held the lock). Not an error for the timer.
+SuccessExitStatus=75
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h
