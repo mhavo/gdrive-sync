@@ -39,17 +39,34 @@ Three rules, in order of how badly they go wrong:
 
 ### The install
 
+Installing is two phases, because one account is not the unit of installation.
+Machine setup happens once; a profile is created per Google account, and the
+profiles are equals — there is no default account and no primary one.
+
 ```bash
 git clone https://github.com/mhavo/gdrive-sync.git ~/Work/gdrive-sync
 cd ~/Work/gdrive-sync
-./install.sh --dry-run      # read this out to the user first
-./install.sh
+./install.sh --dry-run                  # read this out to the user first
+./install.sh                            # machine setup: once
+
+./install.sh --profile=personal --remote=GoogleDrive
+./install.sh --profile=work --remote=GDriveWork
 ```
 
-`install.sh` does the whole installation and nothing else: dependency check,
-remote check, symlinks into `~/.local/bin`, config files from `examples/`,
-systemd units, the `.url` desktop entry. It runs no sync and touches no synced
-data.
+Machine setup is the dependency check, the symlinks into `~/.local/bin`, the
+systemd unit templates and the `.url` desktop entry — none of it
+profile-specific. Profile creation is the profile directory, the config files
+from `examples/`, the remote check against that profile's remote, and that
+instance's units. It runs no sync and touches no synced data.
+
+**Every account needs its own rclone remote.** One remote is one account; a
+profile names the remote it uses. `--local=PATH` moves that profile's local
+root, which defaults to `~/GoogleDrive/<profile>`.
+
+**Two profiles may not share or nest their local roots.** Both `install.sh`
+and `gdrive-sync` refuse it, and the refusal is not a formality: each profile's
+bisync would see the other's files as local changes and carry their absence to
+its own Drive.
 
 What it will not do, by design:
 
@@ -62,7 +79,8 @@ What it will not do, by design:
   every 15 minutes and syncs nothing looks exactly like a broken install.
 
 Useful flags: `--no-watcher`, `--no-desktop`, `--no-enable`, `-y`,
-`--skip-remote-check`, `--uninstall`. Full list: `./install.sh --help`.
+`--skip-remote-check`, `--list`, `--uninstall [--profile=NAME]`. Full list:
+`./install.sh --help`.
 
 In a non-interactive session the script cannot ask, so it does not enable
 anything unless you pass `-y`. Pass `-y` only when the user has actually said
@@ -70,8 +88,8 @@ so.
 
 ### Choosing folders
 
-The user edits `~/.config/rclone-gdrive-sync/folders.txt`, one Drive folder per
-line, path from the root of Drive:
+The user edits `~/.config/gdrive-sync/<profile>/folders.txt`, one Drive folder
+per line, path from the root of Drive:
 
 ```
 Documents
@@ -79,29 +97,37 @@ Projects/2026
 ```
 
 Do not guess folder names from their Drive. If you need to see what is there:
-`rclone lsd GoogleDrive:` — read-only, safe.
+`rclone lsd GoogleDrive:` — read-only, safe. Use that profile's own remote.
 
 ### Verifying, without syncing anything
 
 ```bash
-gdrive-sync --status       # folders, pinned IDs, current name in Drive
-gdrive-sync --list-paths   # the folder table; no network, no lock
-gdrive-sync -n             # preview the rclone operations
-./install.sh --dry-run     # what an install would change now
-systemctl --user status gdrive-sync.timer gdrive-watch.service
-journalctl --user -u gdrive-watch -n 50
+gdrive-sync --list-profiles                 # the profiles, one per line
+gdrive-sync --profile=work --status         # folders, pinned IDs, name in Drive
+gdrive-sync --profile=work --list-paths     # the folder table; no network, no lock
+gdrive-sync --profile=work -n               # preview the rclone operations
+./install.sh --list                         # profiles, remotes, roots, timers
+./install.sh --dry-run                      # what an install would change now
+systemctl --user status gdrive-sync@work.timer gdrive-watch@work.service
+journalctl --user -u gdrive-watch@work -n 50
 ```
 
 All of these are safe to run unprompted. `gdrive-sync` with no flags is not.
 
+`--profile=` can be left out only when exactly one profile exists. With
+several, `gdrive-sync` refuses and lists them — do not work around that by
+picking one yourself.
+
 ### Uninstalling
 
 ```bash
-./install.sh --uninstall
+./install.sh --uninstall --profile=work   # that instance's units only
+./install.sh --uninstall                  # every instance, plus the machine setup
 ```
 
 Removes the symlinks (only those pointing into this clone), the units and the
-desktop entry. Keeps synced files, the config directory, the pinned IDs and
+desktop entry. With `--profile=NAME` only that instance's units go, and the
+other profiles are left alone. Keeps synced files, the config directory, the pinned IDs and
 rclone's configuration. It lists what it will remove and asks first; `-y` skips
 the question. **Do not then offer to delete the synced directory** unless the
 user asks for it in those words — and if they do, make sure they know that a
@@ -119,7 +145,7 @@ later run of a reinstalled gdrive-sync would carry those deletions to Drive.
 | `gdrive-watch` | inotify watcher; gets its folder table from `gdrive-sync --list-paths` |
 | `open-url-shortcut` | opens a `.url` shortcut in a browser |
 | `install.sh` | installer and uninstaller |
-| `systemd/` | user units |
+| `systemd/` | user unit templates, one instance per profile |
 | `examples/` | the files `install.sh` copies into the config directory |
 | `tests/` | the test suite and the command doubles it runs against |
 
@@ -140,6 +166,9 @@ later run of a reinstalled gdrive-sync would carry those deletions to Drive.
   bash does that job.
 - **Line parsing lives in `gdrive-sync` only.** `gdrive-watch` asks for a
   ready-made table with `--list-paths`. Do not add a second parser.
+- **Profile enumeration lives in `gdrive-sync` only**, for the same reason.
+  `install.sh` and the widget ask with `--list-profiles`; do not scan the
+  config root from a second place.
 
 ### Tests
 
@@ -158,7 +187,10 @@ Rules for tests you add:
 - **Never reach the real Drive or the user's rclone config.** If a test needs a
   new rclone subcommand, add it to `tests/fake-bin/rclone`. A test that shells
   out to the real `rclone` is a bug even when it passes.
-- **Use the sandbox.** `make_sandbox` in `tests/lib.sh` redirects every path.
+- **Use the sandbox.** `make_sandbox` in `tests/lib.sh` redirects every path by
+  setting `GDRIVE_CONF_DIR` and `GDRIVE_STATE_DIR` directly, which is why it
+  never resolves a profile. `make_profile_sandbox` sets the two roots instead,
+  for the tests that are about profiles.
 - **Use the hostile names.** `HOSTILE_NAMES` in `tests/lib.sh` covers spaces,
   non-ASCII, brackets and a slash. Folder names are user data from Google
   Drive; a change to name handling that is only tested against `Documents` is
@@ -186,3 +218,15 @@ do:
   permanently failed after a few quick saves, silently watching nothing.
 - **Symlinks, not copies**, into `~/.local/bin`. A copy stops being this
   repository the first time the user pulls.
+- **`gdrive-sync` refuses to guess a profile.** With several profiles and no
+  `--profile=`, it exits 2 and lists them. The wrong profile is the wrong
+  account, and the deletions of a bidirectional sync go with it; there is no
+  default worth the risk.
+- **Two profiles may not share or nest their local roots.** The check runs
+  before every sync and before `install.sh` writes a new profile. Each
+  profile's bisync would otherwise read the other's files as local changes and
+  propagate their absence to its own Drive — silently, in both directions.
+- **The other profiles' `config.env` files are read in a subshell.** They are
+  bash, so sourcing one into the running shell would overwrite the settings of
+  the profile actually being synced: the collision check would corrupt the run
+  it exists to protect.

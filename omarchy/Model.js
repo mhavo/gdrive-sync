@@ -8,7 +8,7 @@
 // ---------------------------------------------------------------- constants
 
 // 75 is EX_TEMPFAIL. gdrive-sync exits with it when another run already holds
-// the lock, and gdrive-sync.service declares SuccessExitStatus=75. An
+// the lock, and gdrive-sync@.service declares SuccessExitStatus=75. An
 // overlapping run is the timer working as designed, so it is never an error.
 var EXIT_LOCK_HELD = 75
 
@@ -23,7 +23,7 @@ var DEFAULT_STUCK_AFTER_MIN = 30
 // a lie.
 var STUCK_PER_FOLDER_MIN = 1
 
-// The ceiling is not a taste decision: systemd/gdrive-sync.service sets
+// The ceiling is not a taste decision: systemd/gdrive-sync@.service sets
 // TimeoutStartSec=2h, so systemd kills any run that lives longer. A run older
 // than 120 minutes cannot exist, which makes anything past it stuck by
 // definition and leaves no reason to wait further.
@@ -47,9 +47,31 @@ var RESULT_RANK = {
   ok: 4
 }
 
-var DEFAULT_CONF_DIR = ".config/rclone-gdrive-sync"
-var DEFAULT_STATE_DIR = ".local/state/rclone-gdrive-sync"
+// Roots, not directories: a profile owns <root>/<profile>. The rclone- prefix
+// the old paths carried named an implementation detail of the sync, which the
+// widget never had any business knowing about.
+var DEFAULT_CONF_ROOT = ".config/gdrive-sync"
+var DEFAULT_STATE_ROOT = ".local/state/gdrive-sync"
 var DEFAULT_LOCAL_ROOT = "GoogleDrive"
+
+// The bar shows one icon for every profile, so the states have to be ordered
+// against each other. This is not deriveState's priority list: there
+// `unconfigured` wins because a widget that cannot work must say so before
+// anything else, while here an account that is genuinely broken has to outrank
+// one that was never set up. Otherwise a work account failing for three days
+// hides behind a personal one nobody ever configured.
+var STATE_URGENCY = {
+  error: 0,
+  syncing: 1,
+  stale: 2,
+  unconfigured: 3,
+  idle: 4
+}
+
+// systemd instance names, and part of the command lines built below. The CLI
+// validates the same set, so a name outside it did not come from a profile
+// directory and is dropped rather than escaped.
+var PROFILE_NAME_RE = /^[A-Za-z0-9._-]+$/
 
 // Material Design icons from the Nerd Font the bar already uses.
 var GLYPHS = {
@@ -196,9 +218,62 @@ function joinPath(base, leaf) {
   return head + "/" + tail
 }
 
-function defaultConfDir(home) { return joinPath(home, DEFAULT_CONF_DIR) }
-function defaultStateDir(home) { return joinPath(home, DEFAULT_STATE_DIR) }
+function defaultConfRoot(home) { return joinPath(home, DEFAULT_CONF_ROOT) }
+function defaultStateRoot(home) { return joinPath(home, DEFAULT_STATE_ROOT) }
 function defaultLocalRoot(home) { return joinPath(home, DEFAULT_LOCAL_ROOT) }
+
+function profileConfDir(home, profile) { return joinPath(defaultConfRoot(home), profile) }
+function profileStateDir(home, profile) { return joinPath(defaultStateRoot(home), profile) }
+// install.sh gives a new profile this root by default, which is what keeps two
+// profiles from sharing one local directory without anybody having to think
+// about it.
+function profileLocalRoot(home, profile) { return joinPath(defaultLocalRoot(home), profile) }
+
+// ----------------------------------------------------------------- profiles
+
+function isProfileName(value) {
+  var name = trim(value)
+  if (name === "." || name === "..") return false
+  return PROFILE_NAME_RE.test(name)
+}
+
+// The lines of `gdrive-sync --list-profiles`. A name the CLI would not accept
+// cannot name a unit either, so it is dropped here rather than carried into a
+// command line.
+function profilesFromOutput(text) {
+  var lines = str(text).split(/\r?\n/)
+  var out = []
+  for (var i = 0; i < lines.length; i++) {
+    var name = trim(lines[i])
+    if (isProfileName(name)) out.push(name)
+  }
+  return out
+}
+
+function stateUrgency(state) {
+  var key = str(state)
+  // An unrecognised state ranks — and reads — as idle, the same fallback
+  // stateGlyph makes. Inventing urgency out of a word nobody wrote would put
+  // an icon on the bar that no code here can explain.
+  return STATE_URGENCY[key] !== undefined ? STATE_URGENCY[key] : STATE_URGENCY.idle
+}
+
+// One icon for several accounts. With no profiles at all there is nothing to
+// report on, which is exactly what `unconfigured` says.
+function worstState(states) {
+  if (!isArray(states) || states.length === 0) return "unconfigured"
+  var best = "idle"
+  var bestRank = STATE_URGENCY.idle
+  for (var i = 0; i < states.length; i++) {
+    var key = str(states[i])
+    var rank = stateUrgency(key)
+    if (rank < bestRank) {
+      bestRank = rank
+      best = STATE_URGENCY[key] !== undefined ? key : "idle"
+    }
+  }
+  return best
+}
 
 // Panel.qml lives in <plugin>/omarchy/, so the repository root that carries
 // install.sh is one level up from the QML file's own directory.
@@ -532,8 +607,26 @@ function watcherRow(watcher, now) {
 // shell process must never wait on rclone. "Sync now" goes through systemd so
 // the unit keeps owning the run, the lock, and the exit-75 contract.
 
-function syncNowCommand() {
-  return "systemctl --user start gdrive-sync.service"
+function syncCommand(profile) {
+  if (!isProfileName(profile)) return ""
+  return "systemctl --user start gdrive-sync@" + trim(profile) + ".service"
+}
+
+function timerUnit(profile) {
+  if (!isProfileName(profile)) return ""
+  return "gdrive-sync@" + trim(profile) + ".timer"
+}
+
+// Every instance in one argument list, so the number of processes the shell
+// spawns stays at one however many accounts the user has.
+function timerUnits(profiles) {
+  var out = []
+  if (!isArray(profiles)) return out
+  for (var i = 0; i < profiles.length; i++) {
+    var unit = timerUnit(profiles[i])
+    if (unit !== "") out.push(unit)
+  }
+  return out
 }
 
 function openPathCommand(path) {
@@ -578,11 +671,31 @@ function timerActiveFromOutput(text) {
   return trim(text) === "active"
 }
 
+// `systemctl is-active a b` prints one word per unit, in the order asked, so
+// the answer is read positionally. Output shorter than the list leaves the
+// rest false: a timer systemd said nothing about is not a running one.
+function timerActiveMap(text, profiles) {
+  var lines = str(text).split(/\r?\n/)
+  var words = []
+  for (var i = 0; i < lines.length; i++) {
+    var word = trim(lines[i])
+    if (word !== "") words.push(word)
+  }
+  var map = {}
+  if (!isArray(profiles)) return map
+  for (var j = 0; j < profiles.length; j++) {
+    map[str(profiles[j])] = j < words.length && words[j] === "active"
+  }
+  return map
+}
+
 // ------------------------------------------------------------------ exports
 
 if (typeof module !== "undefined") {
   module.exports = {
     EXIT_LOCK_HELD: EXIT_LOCK_HELD,
+    DEFAULT_CONF_ROOT: DEFAULT_CONF_ROOT,
+    DEFAULT_STATE_ROOT: DEFAULT_STATE_ROOT,
     DEFAULT_STALE_AFTER_MIN: DEFAULT_STALE_AFTER_MIN,
     DEFAULT_STUCK_AFTER_MIN: DEFAULT_STUCK_AFTER_MIN,
     STUCK_PER_FOLDER_MIN: STUCK_PER_FOLDER_MIN,
@@ -595,9 +708,16 @@ if (typeof module !== "undefined") {
     expandHome: expandHome,
     envValue: envValue,
     joinPath: joinPath,
-    defaultConfDir: defaultConfDir,
-    defaultStateDir: defaultStateDir,
+    defaultConfRoot: defaultConfRoot,
+    defaultStateRoot: defaultStateRoot,
     defaultLocalRoot: defaultLocalRoot,
+    profileConfDir: profileConfDir,
+    profileStateDir: profileStateDir,
+    profileLocalRoot: profileLocalRoot,
+    isProfileName: isProfileName,
+    profilesFromOutput: profilesFromOutput,
+    stateUrgency: stateUrgency,
+    worstState: worstState,
     pluginDirFromUrl: pluginDirFromUrl,
     isUnfinished: isUnfinished,
     isFailedExit: isFailedExit,
@@ -620,12 +740,15 @@ if (typeof module !== "undefined") {
     folderSummary: folderSummary,
     watcherGlyph: watcherGlyph,
     watcherRow: watcherRow,
-    syncNowCommand: syncNowCommand,
+    syncCommand: syncCommand,
+    timerUnit: timerUnit,
+    timerUnits: timerUnits,
     openPathCommand: openPathCommand,
     openTextCommand: openTextCommand,
     journalCommand: journalCommand,
     installCommand: installCommand,
     editFoldersCommand: editFoldersCommand,
-    timerActiveFromOutput: timerActiveFromOutput
+    timerActiveFromOutput: timerActiveFromOutput,
+    timerActiveMap: timerActiveMap
   }
 }

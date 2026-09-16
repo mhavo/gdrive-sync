@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch for local changes and sync them to Drive right away
+Description=Watch for local changes and sync them to Drive right away (profile %i)
 After=network-online.target
 Wants=network-online.target
 
@@ -16,12 +16,15 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 Environment=GDRIVE_SYNC_BIN=%h/.local/bin/gdrive-sync
+# The profile this instance watches. gdrive-watch exports it again, so the
+# gdrive-sync it starts resolves the same profile without a flag.
+Environment=GDRIVE_PROFILE=%i
 ExecStart=%h/.local/bin/gdrive-watch
 Restart=always
 RestartSec=2
 # The watcher itself says little, but it is under this unit that an operator
 # looks for what a save actually triggered. The same reasoning as in
-# gdrive-sync.service applies: systemd's default rate limit drops messages
+# gdrive-sync@.service applies: systemd's default rate limit drops messages
 # silently, and a silently truncated log is worse than a verbose one.
 LogRateLimitIntervalSec=0
 Nice=10

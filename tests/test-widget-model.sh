@@ -277,7 +277,7 @@ const configEnv = [
   "# Settings for gdrive-sync",
   "#GDRIVE_LOCAL=$HOME/GoogleDrive",
   'GDRIVE_LOCAL="$HOME/Drive Files"',
-  "GDRIVE_STATE_DIR=$HOME/.local/state/rclone-gdrive-sync"
+  "GDRIVE_STATE_DIR=$HOME/.local/state/gdrive-sync/work"
 ].join("\n")
 emit("config-local-root", M.envValue(configEnv, "GDRIVE_LOCAL", "/fallback", "/home/u"))
 emit("config-state-dir", M.envValue(configEnv, "GDRIVE_STATE_DIR", "/fallback", "/home/u"))
@@ -286,7 +286,7 @@ emit("config-commented-out-only", M.envValue("#GDRIVE_LOCAL=$HOME/Nope\n", "GDRI
 
 // The buttons that open folders.txt and filter.txt must resolve the same
 // overrides gdrive-sync honours, or they open a file the tool is not reading.
-const confDir = "/home/u/.config/rclone-gdrive-sync"
+const confDir = M.profileConfDir("/home/u", "work")
 const movedEnv = [
   "GDRIVE_FOLDERS=$HOME/Sync/folders.txt",
   'GDRIVE_FILTER="$HOME/Sync/my filter.txt"'
@@ -300,8 +300,6 @@ emit("edit-config-uses-editor", /omarchy-launch-editor/.test(M.openTextCommand(M
 emit("edit-nothing", M.openTextCommand("") === "")
 
 // --- commands are fire-and-forget, and never run rclone ---------------------
-emit("sync-now-command", M.syncNowCommand())
-emit("sync-now-avoids-cli", /gdrive-sync\.service$/.test(M.syncNowCommand()) && !/rclone/.test(M.syncNowCommand()))
 emit("open-folder-quoted", M.openPathCommand("/home/u/Drive Files"))
 emit("open-nothing", M.openPathCommand("") === "")
 emit("quote-hostile-name", M.shellQuote("Photos [2026]'s"))
@@ -309,6 +307,68 @@ emit("install-command-has-no-sudo", !/sudo/.test(M.installCommand("/plugins/mhav
 emit("install-command-mentions-script", /install\.sh/.test(M.installCommand("/plugins/mhavo.gdrive-sync")))
 emit("plugin-dir-from-url", M.pluginDirFromUrl("file:///home/u/.config/omarchy/plugins/mhavo.gdrive-sync/omarchy/"))
 emit("timer-active-parsing", [M.timerActiveFromOutput("active\n"), M.timerActiveFromOutput("inactive\n")].join(","))
+
+// --- the worst state across every profile -----------------------------------
+// The bar shows one icon for several accounts, so the ordering here is not
+// deriveState's. There `unconfigured` outranks everything because a widget
+// that cannot work says so first; across profiles a *working* account that is
+// actually broken has to win over one that was never set up, or a work
+// account failing for three days hides behind a personal one nobody uses.
+emit("worst-of-nothing", M.worstState([]))
+emit("worst-single", M.worstState(["syncing"]))
+emit("worst-error-wins", M.worstState(["idle", "error", "syncing"]))
+emit("worst-syncing-over-stale", M.worstState(["stale", "syncing", "idle"]))
+emit("worst-stale-over-unconfigured", M.worstState(["unconfigured", "stale"]))
+emit("worst-unconfigured-over-idle", M.worstState(["idle", "unconfigured", "idle"]))
+emit("worst-all-idle", M.worstState(["idle", "idle"]))
+emit("worst-unknown-reads-as-idle", M.worstState(["nonsense"]))
+emit("worst-unknown-loses-to-stale", M.worstState(["nonsense", "stale"]))
+emit("worst-of-garbage", M.worstState(null))
+
+// --- units and commands carry the profile -----------------------------------
+emit("sync-command", M.syncCommand("work"))
+emit("timer-unit", M.timerUnit("work"))
+emit("sync-command-avoids-cli",
+  /gdrive-sync@work\.service$/.test(M.syncCommand("work")) && !/rclone/.test(M.syncCommand("work")))
+emit("sync-command-no-profile", M.syncCommand("") === "")
+emit("timer-unit-no-profile", M.timerUnit("") === "")
+// A name reaches systemd and a shell command line unquoted, so anything the
+// CLI would have refused is refused here too rather than escaped.
+emit("sync-command-rejects-a-space", M.syncCommand("not a name") === "")
+emit("timer-unit-rejects-a-slash", M.timerUnit("a/b") === "")
+emit("profile-name-checks",
+  [M.isProfileName("."), M.isProfileName(".."), M.isProfileName("a.b"), M.isProfileName("A_0-9")].join(","))
+emit("timer-units-for-several", M.timerUnits(["work", "personal"]).join(" "))
+emit("timer-units-skip-invalid", M.timerUnits(["work", "not a name", ""]).join(" "))
+emit("timer-units-of-nothing", M.timerUnits([]).length)
+
+// --- the profile list, as --list-profiles prints it -------------------------
+emit("profiles-from-output", M.profilesFromOutput("work\npersonal\n").join(","))
+emit("profiles-trimmed", M.profilesFromOutput("  work  \n\n personal\n").join(","))
+emit("profiles-empty", M.profilesFromOutput("").length)
+emit("profiles-drop-invalid", M.profilesFromOutput("work\nnot a profile\n../escape\n").join(","))
+emit("profiles-of-garbage", M.profilesFromOutput(null).length)
+
+// --- one is-active call answers for every instance --------------------------
+// `systemctl is-active a b` prints one word per unit, in the order asked, so
+// the answer is read positionally. A short answer leaves the rest unknown,
+// which is `false` here: an unreported timer is not a running one.
+emit("timer-map-both", JSON.stringify(M.timerActiveMap("active\ninactive\n", ["work", "personal"])))
+emit("timer-map-short-output", JSON.stringify(M.timerActiveMap("active\n", ["work", "personal"])))
+emit("timer-map-no-output", JSON.stringify(M.timerActiveMap("", ["work"])))
+emit("timer-map-no-profiles", JSON.stringify(M.timerActiveMap("active\n", [])))
+emit("timer-map-other-words", JSON.stringify(M.timerActiveMap("failed\nactivating\n", ["a", "b"])))
+
+// --- roots, and the directories a profile owns under them -------------------
+emit("conf-root", M.defaultConfRoot("/home/u"))
+emit("state-root", M.defaultStateRoot("/home/u"))
+emit("profile-conf-dir", M.profileConfDir("/home/u", "work"))
+emit("profile-state-dir", M.profileStateDir("/home/u", "work"))
+emit("profile-local-root", M.profileLocalRoot("/home/u", "work"))
+// The rclone- prefix named an implementation detail and is gone with the
+// breaking change; nothing may quietly put it back.
+emit("roots-dropped-the-rclone-prefix",
+  !/rclone/.test(M.defaultConfRoot("/home/u") + M.defaultStateRoot("/home/u")))
 
 process.stdout.write(out.join("\n") + "\n")
 JS
@@ -429,15 +489,13 @@ expect duration 1m
 expect duration-long "1h 2m"
 
 expect config-local-root "/home/u/Drive Files"
-expect config-state-dir "/home/u/.local/state/rclone-gdrive-sync"
+expect config-state-dir "/home/u/.local/state/gdrive-sync/work"
 expect config-missing-key GoogleDrive
 expect config-commented-out-only /fallback
 
-expect sync-now-command "systemctl --user start gdrive-sync.service"
-expect sync-now-avoids-cli true
 expect open-folder-quoted "xdg-open '/home/u/Drive Files'"
-expect folders-path-default "/home/u/.config/rclone-gdrive-sync/folders.txt"
-expect filter-path-default "/home/u/.config/rclone-gdrive-sync/filter.txt"
+expect folders-path-default "/home/u/.config/gdrive-sync/work/folders.txt"
+expect filter-path-default "/home/u/.config/gdrive-sync/work/filter.txt"
 expect folders-path-overridden "/home/u/Sync/folders.txt"
 expect filter-path-overridden "/home/u/Sync/my filter.txt"
 expect edit-filter-quoted "if command -v omarchy-launch-editor >/dev/null 2>&1; then omarchy-launch-editor '/home/u/Sync/my filter.txt'; else xdg-open '/home/u/Sync/my filter.txt'; fi"
@@ -449,5 +507,48 @@ expect install-command-has-no-sudo true
 expect install-command-mentions-script true
 expect plugin-dir-from-url "/home/u/.config/omarchy/plugins/mhavo.gdrive-sync"
 expect timer-active-parsing "true,false"
+
+# The bar icon speaks for every profile at once.
+expect worst-of-nothing unconfigured
+expect worst-single syncing
+expect worst-error-wins error
+expect worst-syncing-over-stale syncing
+expect worst-stale-over-unconfigured stale
+expect worst-unconfigured-over-idle unconfigured
+expect worst-all-idle idle
+expect worst-unknown-reads-as-idle idle
+expect worst-unknown-loses-to-stale stale
+expect worst-of-garbage unconfigured
+
+expect sync-command "systemctl --user start gdrive-sync@work.service"
+expect timer-unit "gdrive-sync@work.timer"
+expect sync-command-avoids-cli true
+expect sync-command-no-profile true
+expect timer-unit-no-profile true
+expect sync-command-rejects-a-space true
+expect timer-unit-rejects-a-slash true
+expect profile-name-checks "false,false,true,true"
+expect timer-units-for-several "gdrive-sync@work.timer gdrive-sync@personal.timer"
+expect timer-units-skip-invalid "gdrive-sync@work.timer"
+expect timer-units-of-nothing 0
+
+expect profiles-from-output "work,personal"
+expect profiles-trimmed "work,personal"
+expect profiles-empty 0
+expect profiles-drop-invalid work
+expect profiles-of-garbage 0
+
+expect timer-map-both '{"work":true,"personal":false}'
+expect timer-map-short-output '{"work":true,"personal":false}'
+expect timer-map-no-output '{"work":false}'
+expect timer-map-no-profiles '{}'
+expect timer-map-other-words '{"a":false,"b":false}'
+
+expect conf-root "/home/u/.config/gdrive-sync"
+expect state-root "/home/u/.local/state/gdrive-sync"
+expect profile-conf-dir "/home/u/.config/gdrive-sync/work"
+expect profile-state-dir "/home/u/.local/state/gdrive-sync/work"
+expect profile-local-root "/home/u/GoogleDrive/work"
+expect roots-dropped-the-rclone-prefix true
 
 finish

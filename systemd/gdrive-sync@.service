@@ -1,11 +1,15 @@
 [Unit]
-Description=Bidirectional rclone bisync with Google Drive
+Description=Bidirectional rclone bisync with Google Drive (profile %i)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=%h/.local/bin/gdrive-sync
+# The profile this instance syncs. Passed as an environment variable rather
+# than as a --profile flag so that ExecStart stays the one line it has always
+# been, identical for every instance.
+Environment=GDRIVE_PROFILE=%i
 # Recorded in status.json, so the desktop widget can tell an unattended run
 # apart from one the user started.
 Environment=GDRIVE_TRIGGER=timer

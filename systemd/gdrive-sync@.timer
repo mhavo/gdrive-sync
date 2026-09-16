@@ -1,5 +1,5 @@
 [Unit]
-Description=Run the Google Drive sync regularly
+Description=Run the Google Drive sync regularly (profile %i)
 
 [Timer]
 OnBootSec=3min

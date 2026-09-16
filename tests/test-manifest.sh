@@ -59,8 +59,23 @@ while IFS= read -r entry; do
 done < <(jq -r '.entryPoints[]' "$MANIFEST")
 
 # The widget's own files, whether or not the manifest happens to name them.
-for file in omarchy/Panel.qml omarchy/Service.qml omarchy/Model.js; do
+for file in omarchy/Panel.qml omarchy/Service.qml omarchy/ProfileState.qml omarchy/Model.js; do
   assert_path "$file exists" "$REPO_ROOT/$file"
+done
+
+# One widget covers every profile, so a second instance would only duplicate
+# the same icon; the popup picks the account instead.
+assert_eq "barWidget.allowMultiple stays false" "false" \
+  "$(jq -r '.barWidget.allowMultiple' "$MANIFEST")"
+
+# Every settings key the widget reads must be declared, or Omarchy shows the
+# user no way to set it. defaultProfile is the only per-profile one: the two
+# thresholds are deliberately global and apply to every account.
+for key in showLabel defaultProfile staleAfterMin stuckAfterMin; do
+  assert_eq "schema declares $key" true \
+    "$(jq -r --arg k "$key" '[.barWidget.schema[].key] | index($k) != null' "$MANIFEST")"
+  assert_eq "defaults carry $key" true \
+    "$(jq -r --arg k "$key" '.barWidget.defaults | has($k)' "$MANIFEST")"
 done
 
 # The silent trap: one symlink anywhere in the checkout and the validator

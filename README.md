@@ -1,11 +1,15 @@
 # gdrive-sync
 
 Keeps selected Google Drive folders and a directory on your machine
-(`~/GoogleDrive`) identical. A change on either side travels to the other on
-the next run. Underneath is `rclone bisync`; on top is a small bash script that
-handles folder selection, initialisation and safety checks.
+(`~/GoogleDrive/<profile>`) identical. A change on either side travels to the
+other on the next run. Underneath is `rclone bisync`; on top is a small bash
+script that handles folder selection, initialisation and safety checks.
 
 Not all of Drive is synced. Folders are picked one at a time in a list file.
+
+Several Google accounts are supported as equal *profiles* — a personal one and
+a work one, each with its own folders, its own timer and its own state. Neither
+is primary.
 
 ## Why this and not X
 
@@ -137,6 +141,12 @@ rclone lsd GoogleDrive:
 That must list your Drive folders. If it does not, fix it here — nothing below
 will work until it does.
 
+**One account, one remote.** Each Google account you want to sync needs its own
+rclone remote, set up the same way and named distinctly — `GoogleDrive:` and
+`GDriveWork:`, say. rclone handles one remote per account without complaint;
+this project's profiles (below) are the layer that decides which remote a run,
+a timer and the desktop widget are talking about.
+
 **On a headless machine** there is no browser for the OAuth redirect. Either run
 `rclone authorize` on a machine that has one and paste the token back, or
 forward the port rclone listens on:
@@ -154,26 +164,45 @@ plus `inotify-tools` for the watcher. The remote is assumed to be named
 `GoogleDrive:`; a different name and other paths are available through a config
 file, see [Configuration](#configuration).
 
+Installing is two phases, because one Google account is not the unit of
+installation. **Machine setup** happens once; a **profile** is created per
+account.
+
 ```bash
 git clone https://github.com/mhavo/gdrive-sync.git ~/Work/gdrive-sync
 cd ~/Work/gdrive-sync
 
 ./install.sh --dry-run    # every step, performed none of them
-./install.sh
+./install.sh              # machine setup: dependencies, symlinks, units, desktop entry
+
+./install.sh --profile=personal --remote=GoogleDrive
+./install.sh --profile=work     --remote=GDriveWork
 ```
 
-`install.sh` checks the dependencies, checks that the remote answers, links the
-scripts into `~/.local/bin`, copies the config files out of `examples/`,
-installs the systemd units and registers the `.url` desktop entry.
+Machine setup checks the dependencies, links the scripts into `~/.local/bin`,
+installs the systemd unit templates and registers the `.url` desktop entry.
+Creating a profile makes its config directory, copies the config files out of
+`examples/`, checks that *that profile's* remote answers, and enables that
+instance's timer.
+
+Profiles are equals. There is no default account and no primary one, nothing is
+shared between them, and each profile owns its `folders.txt`, `filter.txt` and
+`config.env`. A profile's local root defaults to `~/GoogleDrive/<profile>`;
+`--local=PATH` puts it elsewhere.
 
 It syncs nothing. The first run stays yours, because that is the run where a
 wrong folder or a wrong remote shows up and you want to be looking at it:
 
 ```bash
-$EDITOR ~/.config/rclone-gdrive-sync/folders.txt   # add your folders
-gdrive-sync -n     # previews rclone operations; changes no synced data or wrapper state
-gdrive-sync
+$EDITOR ~/.config/gdrive-sync/work/folders.txt   # add your folders
+gdrive-sync --profile=work -n   # previews rclone operations; changes nothing
+gdrive-sync --profile=work
 ```
+
+`--profile=` can be left out when exactly one profile exists. With several,
+`gdrive-sync` refuses and lists them rather than guessing: the wrong profile is
+the wrong account, and in a bidirectional sync the deletions go with it.
+`gdrive-sync --list-profiles` prints the profiles, one per line.
 
 Three things the installer will not do. It does not run your package manager —
 missing commands are named and it stops, because installing packages as root is
@@ -182,11 +211,18 @@ not what you asked for. It does not overwrite a config file that already exists,
 is still empty, because a timer that fires every 15 minutes and syncs nothing
 looks exactly like a broken install.
 
-Flags: `--no-watcher`, `--no-desktop`, `--no-enable`, `-y`,
-`--skip-remote-check`, `--uninstall`. See `./install.sh --help`.
+Flags: `--profile=NAME`, `--remote=NAME`, `--local=PATH`, `--list`,
+`--no-watcher`, `--no-desktop`, `--no-enable`, `-y`, `--skip-remote-check`,
+`--uninstall`. See `./install.sh --help`.
 
-`./install.sh --uninstall` removes the symlinks, the units and the desktop
-entry, and keeps your synced files, your config and the pinned IDs.
+`./install.sh --list` shows the profiles with their remotes, their local roots
+and whether each timer is enabled.
+
+`./install.sh --uninstall --profile=work` removes that instance's units and
+leaves the other profiles alone; `./install.sh --uninstall` with no profile
+removes everything — all instances, the symlinks, the templates and the desktop
+entry. Neither touches your synced files, your profile directories or the
+pinned IDs.
 
 <details>
 <summary><b>By hand</b>, if you would rather see every step</summary>
@@ -197,28 +233,30 @@ ln -s ~/Work/gdrive-sync/gdrive-sync        ~/.local/bin/gdrive-sync
 ln -s ~/Work/gdrive-sync/gdrive-watch       ~/.local/bin/gdrive-watch
 ln -s ~/Work/gdrive-sync/open-url-shortcut  ~/.local/bin/open-url-shortcut
 
-# Folder list and filters
-mkdir -p ~/.config/rclone-gdrive-sync
-cp examples/folders.txt examples/filter.txt ~/.config/rclone-gdrive-sync/
-$EDITOR ~/.config/rclone-gdrive-sync/folders.txt   # add your folders
+# One profile per Google account. "work" here; repeat for the next account.
+mkdir -p ~/.config/gdrive-sync/work
+cp examples/folders.txt examples/filter.txt ~/.config/gdrive-sync/work/
+$EDITOR ~/.config/gdrive-sync/work/folders.txt   # add your folders
 
-# Optional: change the remote name and paths (see Configuration)
-cp examples/config.env ~/.config/rclone-gdrive-sync/
-chmod 600 ~/.config/rclone-gdrive-sync/config.env
+# The remote and the local root of this profile (see Configuration).
+# Two profiles may not share or nest their local roots.
+cp examples/config.env ~/.config/gdrive-sync/work/
+chmod 600 ~/.config/gdrive-sync/work/config.env
+$EDITOR ~/.config/gdrive-sync/work/config.env
 
 # First run by hand, so you see what happens
-gdrive-sync -n
-gdrive-sync
+gdrive-sync --profile=work -n
+gdrive-sync --profile=work
 
-# Timer on
-cp systemd/gdrive-sync.* ~/.config/systemd/user/
+# Timer on. The units are templates: the part after @ is the profile.
+cp systemd/gdrive-sync@.* ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now gdrive-sync.timer
+systemctl --user enable --now gdrive-sync@work.timer
 
 # Optional: watcher for instant local-to-Drive sync
-cp systemd/gdrive-watch.service ~/.config/systemd/user/
+cp systemd/gdrive-watch@.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now gdrive-watch.service
+systemctl --user enable --now gdrive-watch@work.service
 
 # For opening Google Docs files (see below)
 cp desktop/url-shortcut.desktop ~/.local/share/applications/
@@ -234,19 +272,32 @@ why deleting a local directory here is not a local operation.
 
 ## Configuration
 
-Without a config file the defaults apply: remote `GoogleDrive:`, local root
-`~/GoogleDrive`, config in `~/.config/rclone-gdrive-sync/` and state in
-`~/.local/state/rclone-gdrive-sync/`. That is usually enough.
+Everything is per profile. A profile is a directory name and nothing else —
+there is no registry file, because a second source of truth beside the
+directory layout would be free to disagree with it:
 
-To change something, copy `examples/config.env` into the config directory and
-uncomment the lines you want:
+```
+~/.config/gdrive-sync/work/{folders.txt,filter.txt,config.env}
+~/.local/state/gdrive-sync/work/{initialized/,lock,status.json,watcher.json}
+~/GoogleDrive/work/
+```
+
+A profile name is one path segment of `[A-Za-z0-9._-]`: it becomes both a
+directory name and a systemd instance name, so it is validated rather than
+escaped.
+
+`install.sh` writes the remote and the local root into the profile's
+`config.env`. To change anything else, uncomment the lines you want in it:
 
 | Variable | Default | What |
 |---|---|---|
 | `GDRIVE_REMOTE` | `GoogleDrive` | rclone remote name (`rclone config`) |
-| `GDRIVE_LOCAL` | `$HOME/GoogleDrive` | local root directory |
-| `GDRIVE_STATE_DIR` | `$HOME/.local/state/rclone-gdrive-sync` | pinned IDs, logs, lock |
-| `GDRIVE_CONF_DIR` | `$HOME/.config/rclone-gdrive-sync` | config directory (environment only — it is read before the config file) |
+| `GDRIVE_LOCAL` | `$HOME/GoogleDrive/<profile>` | local root directory |
+| `GDRIVE_STATE_DIR` | `$GDRIVE_STATE_ROOT/<profile>` | pinned IDs, lock, status.json |
+| `GDRIVE_PROFILE` | — | which profile (command line or environment only — it is read before the config file) |
+| `GDRIVE_CONF_DIR` | `$GDRIVE_CONF_ROOT/<profile>` | config directory (environment only — same reason) |
+| `GDRIVE_CONF_ROOT` | `$HOME/.config/gdrive-sync` | where the profile directories live (environment only) |
+| `GDRIVE_STATE_ROOT` | `$HOME/.local/state/gdrive-sync` | where the profile state directories live (environment only) |
 | `GDRIVE_FOLDERS` | `$GDRIVE_CONF_DIR/folders.txt` | folder list |
 | `GDRIVE_FILTER` | `$GDRIVE_CONF_DIR/filter.txt` | rclone filter file |
 | `GDRIVE_DEBOUNCE_SEC` | `5` | watcher: how long changes must be quiet before syncing |
@@ -256,27 +307,32 @@ uncomment the lines you want:
 The config file is sourced as bash, so keep it to variable assignments and keep
 its permissions to yourself (`chmod 600`).
 
+An explicit `GDRIVE_CONF_DIR` or `GDRIVE_STATE_DIR` outranks the profile. That
+is the escape hatch for a directory somewhere else entirely, and it is what the
+test suite uses.
+
 ## Seeing what is going on
 
 `--status` is the command that shows you where things stand:
 
 ```
 Documents
-  local     : /home/user/GoogleDrive/Documents
+  local     : /home/user/GoogleDrive/work/Documents
   ID        : 0BwyG7PLuwLCCWTR0UWJVc2kzQ0k (pinned 2026-09-15T12:18:09+03:00)
   in Drive  : renamed: Documents 2026
 ```
 
 `--status` asks Drive about every folder, so it costs a network round trip per
-folder and is meant for a human at a terminal.
+folder and is meant for a human at a terminal. It reports on one profile —
+`gdrive-sync --profile=work --status`.
 
 **For a program there are two files instead**, written by the tool itself and
 readable without touching the network:
 
 | File | Written by | What |
 |---|---|---|
-| `~/.local/state/rclone-gdrive-sync/status.json` | `gdrive-sync` | the last run: when it started and finished, its exit code, what triggered it, and one entry per folder with its result |
-| `~/.local/state/rclone-gdrive-sync/watcher.json` | `gdrive-watch` | what the watcher is doing: `watching`, `pending`, `syncing`, `retry` or `stopped` |
+| `~/.local/state/gdrive-sync/<profile>/status.json` | `gdrive-sync` | the last run: when it started and finished, its exit code, what triggered it, and one entry per folder with its result |
+| `~/.local/state/gdrive-sync/<profile>/watcher.json` | `gdrive-watch` | what the watcher is doing: `watching`, `pending`, `syncing`, `retry` or `stopped` |
 
 ```json
 {
@@ -322,6 +378,24 @@ cd ~/.config/omarchy/plugins/mhavo.gdrive-sync && ./install.sh
 Either order works: the widget can be installed first and will say what is
 still missing, or `install.sh` can be run first from a clone of your own.
 
+`plugin add` leaves a copy, which is right for using the widget and wrong for
+working on it: edits in your clone never reach the bar. Point the plugin at the
+clone instead, and a reload is the whole cycle:
+
+```bash
+ln -sfn ~/path/to/gdrive-sync ~/.config/omarchy/plugins/mhavo.gdrive-sync
+omarchy-shell shell rescanPlugins
+```
+
+The repository root is already the plugin root — `manifest.json` sits in it and
+names `omarchy/Panel.qml` — so nothing needs rearranging. `rescanPlugins` picks
+up QML and JavaScript; a changed `manifest.json` wants `omarchy restart shell`.
+
+**One widget, every profile.** The bar icon shows the worst state across all of
+them, and the popup has a profile picker. That way round because the other way
+would hide a work account that has been failing for three days behind an icon
+reporting cheerfully on the personal one.
+
 | Icon | Means |
 |---|---|
 | normal | last run succeeded |
@@ -329,6 +403,9 @@ still missing, or `install.sh` can be run first from a clone of your own.
 | `urgent` colour | the last run failed, or a folder reported an error |
 | dim | nothing has run in a while, the timer is off, or a run appears stuck |
 | dim, with a mark | `gdrive-sync` is not on `PATH`, or `folders.txt` is empty |
+
+The icon is the worst of the profiles' states, in that order of urgency; the
+picker marks the profiles that need attention.
 
 "Appears stuck" scales with the work: the widget allows a base time (45 minutes
 by default) plus a minute per folder, capped at two hours because the unit's
@@ -342,8 +419,9 @@ rather than by their position in `folders.txt` — errors first, then skipped,
 then folders still running, with the healthy ones last — so a single failure
 among a hundred folders is at the top instead of somewhere down the scroll.
 Above eight folders the header adds a count (`99 ok · 1 error`). Its buttons are
-**Sync now** (`systemctl --user start gdrive-sync.service`, so the lock and the
-exit-75 contract behave exactly as they do from the timer), **Open folder** and
+**Sync now** (`systemctl --user start gdrive-sync@<profile>.service` for the
+selected profile, so the lock and the exit-75 contract behave exactly as they
+do from the timer), **Open folder** and
 **Follow log** (`journalctl --user -t gdrive-sync -t gdrive-watch -f`).
 
 Below those it opens the configuration: **Edit folders.txt** and **Edit
@@ -360,8 +438,9 @@ Exit 75 is not shown as a failure. It means a run was already going and this
 one stood aside, which is the system working.
 
 **Removing it** takes both halves, because they are separate installs:
-`./install.sh --uninstall` removes the symlinks, units and desktop entry, and
-`omarchy plugin remove mhavo.gdrive-sync` removes the widget.
+`./install.sh --uninstall` removes the symlinks, units and desktop entry of
+every profile, and `omarchy plugin remove mhavo.gdrive-sync` removes the
+widget.
 
 One constraint worth knowing if you fork this: Omarchy refuses a plugin folder
 containing any symlink, so the repository must not gain one. `tests/test-manifest.sh`
@@ -373,14 +452,16 @@ Everything this project prints goes to the systemd journal and nowhere else.
 There is no log file, no rotation to configure and nothing to clean up.
 
 ```bash
-journalctl --user -t gdrive-sync -t gdrive-watch -f   # both, live
-journalctl --user -u gdrive-sync.service --since today
-journalctl --user -u gdrive-watch.service
+journalctl --user -t gdrive-sync -t gdrive-watch -f    # every profile, live
+journalctl --user -u gdrive-sync@work.service --since today
+journalctl --user -u gdrive-watch@work.service
 ```
 
-Run by hand, the same output simply goes to your terminal.
+Run by hand, the same output simply goes to your terminal. Each profile is its
+own systemd instance, so `-u gdrive-sync@work` separates the accounts' logs
+without any further work.
 
-Earlier versions wrote `~/.local/state/rclone-gdrive-sync/logs/<date>.log` and
+Earlier versions wrote `~/.local/state/gdrive-sync/logs/<date>.log` and
 deleted files older than 30 days. The reason for dropping it is size: rclone at
 `--log-level INFO` produced about 170 kB a day for two folders, so a hundred
 folders would be roughly 8.5 MB a day and a quarter of a gigabyte inside the
@@ -400,7 +481,7 @@ deletes it for you; remove it by hand when you no longer want it.
 ## Adding and removing a folder
 
 **Adding:** write a line into
-`~/.config/rclone-gdrive-sync/folders.txt`. The next run does the rest: resolves
+`~/.config/gdrive-sync/<profile>/folders.txt`. The next run does the rest: resolves
 the ID, creates the local directory and performs the first initialising run. It
 deletes nothing on either side — it merges both and keeps the newer version when
 the same file exists in both.
@@ -446,22 +527,24 @@ trash and is not lost permanently.
 | The same file changed on both sides | The newer one wins, the older is kept alongside it as `file.conflict1`. Nothing is lost. |
 | Everything stopped syncing after about a week | The OAuth consent screen is in *Testing* status and the grant expired. Publish the app in the Google API Console, then `rclone config reconnect GoogleDrive:` |
 | `failed to get token` / auth errors in the log | Check the remote itself first: `rclone lsd GoogleDrive:` |
-| Timer off | `systemctl --user disable --now gdrive-sync.timer` — running by hand still works |
-| Watcher off | `systemctl --user disable --now gdrive-watch.service` — the timer keeps syncing |
-| You want to see what happened | Everything is in the journal: `journalctl --user -t gdrive-sync -t gdrive-watch -f` for both, or `-u gdrive-sync.service` for one timer run |
+| Timer off | `systemctl --user disable --now gdrive-sync@work.timer` — running by hand still works |
+| Watcher off | `systemctl --user disable --now gdrive-watch@work.service` — the timer keeps syncing |
+| `Several profiles exist` | Name one: `gdrive-sync --profile=work …`. There is no default account. |
+| `Local root collision with profile` | Two profiles share or nest their local roots. Give one of them a root of its own in that profile's `config.env` — and do not move files between them by hand while both are syncing. |
+| You want to see what happened | Everything is in the journal: `journalctl --user -t gdrive-sync -t gdrive-watch -f` for both accounts at once, or `-u gdrive-sync@work` for one profile |
 
 ## What lives where
 
 | Path | What |
 |---|---|
-| `~/.config/rclone-gdrive-sync/folders.txt` | folder list, the file you edit |
-| `~/.config/rclone-gdrive-sync/config.env` | settings: remote name and paths (optional) |
-| `~/.config/rclone-gdrive-sync/filter.txt` | junk files to skip (`.DS_Store`, `Thumbs.db`, lock files) |
-| `~/GoogleDrive/` | synced content |
-| `~/.local/state/rclone-gdrive-sync/initialized/` | recorded folder IDs |
+| `~/.config/gdrive-sync/<profile>/folders.txt` | folder list, the file you edit |
+| `~/.config/gdrive-sync/<profile>/config.env` | settings: remote name and paths |
+| `~/.config/gdrive-sync/<profile>/filter.txt` | junk files to skip (`.DS_Store`, `Thumbs.db`, lock files) |
+| `~/GoogleDrive/<profile>/` | synced content |
+| `~/.local/state/gdrive-sync/<profile>/initialized/` | recorded folder IDs |
 | the systemd journal | logs — this project writes no log file |
-| `~/.local/state/rclone-gdrive-sync/status.json` | last run, machine-readable |
-| `~/.local/state/rclone-gdrive-sync/watcher.json` | watcher state, machine-readable |
+| `~/.local/state/gdrive-sync/<profile>/status.json` | last run, machine-readable |
+| `~/.local/state/gdrive-sync/<profile>/watcher.json` | watcher state, machine-readable |
 | `~/.config/omarchy/plugins/mhavo.gdrive-sync/` | the Omarchy widget, when installed |
 | `~/.cache/rclone/bisync/` | rclone's comparison listings, built by `--resync` |
 
@@ -493,11 +576,35 @@ Reasons for individual choices, in case they look arbitrary:
   read-modify-write, and the watcher marking a folder pending while a sync
   writes its result would lose one of the two. With a single writer each, both
   writes are a plain atomic replace and need no lock; the reader merges them.
+- **Two profiles may not share or nest their local roots** — and this is the
+  one check that exists to prevent data loss rather than to enable a feature.
+  Under a shared root each profile's bisync sees the other's files as local
+  changes and carries their absence to its own Drive. The failure is silent,
+  bidirectional and not obviously recoverable, so it is refused before the run.
+  The other profiles' `config.env` files are read in a subshell for the check:
+  they are bash, and sourcing one into the running shell would overwrite the
+  settings of the profile actually being synced.
+- **No shared configuration layer between profiles** — every profile owns its
+  `folders.txt`, `filter.txt` and `config.env` outright. A shared layer would
+  buy a little less duplication and cost the property that makes this safe: a
+  profile's settings can be read, and changed, without working out what some
+  other account's file contributes to them. Two accounts are two accounts.
+- **A profile is a directory, not a registry entry** — the directory layout is
+  the list of profiles (`gdrive-sync --list-profiles` reads it). A registry
+  file would be a second source of truth, free to disagree with the directories
+  that hold every other setting.
+- **`gdrive-sync` refuses to guess a profile** — with more than one it exits and
+  lists them. A default would mean that the day someone forgets the flag, a
+  bidirectional sync with its deletions runs against the wrong Drive.
 - **`StartLimitIntervalSec=0`** on the watcher unit — the watcher exits 0 on
   purpose when `folders.txt` changes, so systemd re-reads the folder table.
   systemd's default limit (5 starts in 10 seconds) would leave the unit
   permanently failed after a few quick saves. Silently watching nothing is the
   one failure mode this must not produce.
+- **Profiles run in parallel, with no global lock** — the lock lives in the
+  state directory, which is per profile, so two accounts syncing at once cannot
+  collide. `RandomizedDelaySec=60` on the timer spreads the instances apart,
+  and both units already run at `Nice=10` and `IOSchedulingClass=idle`.
 
 ## Tests
 
@@ -508,8 +615,10 @@ tests/run-tests.sh
 No network and no Drive account needed: `gdrive-sync` takes its whole
 environment from variables, so the tests run in a sandbox — `install.sh`
 included, against a fake `rclone` and a sandboxed set of install paths.
-`shellcheck` and the inotify integration test are skipped if the tools are
-missing.
+`tests/test-profiles.sh` covers the profile rules, including the two refusals
+that keep the wrong account out of a run. `shellcheck`, `systemd-analyze` and
+the inotify integration test are skipped if the tools are missing — a skip is
+not a pass.
 
 ## Licence
 

@@ -18,16 +18,72 @@ set -uo pipefail
 
 VERSION="0.1.0"
 
+# --- Profile ----------------------------------------------------------------
+# The same resolution as in gdrive-sync, and for the same reason: --profile= has
+# to be read before the config file, because it decides which config file is
+# read. The profile is exported, so the gdrive-sync this script starts resolves
+# the same one without being told again.
+CONF_ROOT="${GDRIVE_CONF_ROOT:-$HOME/.config/gdrive-sync}"
+STATE_ROOT="${GDRIVE_STATE_ROOT:-$HOME/.local/state/gdrive-sync}"
+PROFILE="${GDRIVE_PROFILE:-}"
+# An empty --profile= is a mistake, not an omission, and is refused as one.
+# Without this flag it would be indistinguishable from not passing the option.
+PROFILE_GIVEN=0
+
+profile_valid() {
+  local name="$1"
+  [[ -n "$name" && "$name" != "." && "$name" != ".." ]] || return 1
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+list_profiles() {
+  local dir name
+  for dir in "$CONF_ROOT"/*/; do
+    [[ -d "$dir" ]] || continue
+    name="${dir%/}"; name="${name##*/}"
+    profile_valid "$name" || continue
+    printf '%s\n' "$name"
+  done
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --profile=*) PROFILE="${arg#--profile=}"; PROFILE_GIVEN=1 ;;
+  esac
+done
+
+if [[ -z "${GDRIVE_CONF_DIR:-}" || -z "${GDRIVE_STATE_DIR:-}" ]]; then
+  if [[ -n "$PROFILE" ]] || (( PROFILE_GIVEN )); then
+    if ! profile_valid "$PROFILE"; then
+      printf 'Invalid profile name: %s\n' "$PROFILE" >&2
+      exit 2
+    fi
+  else
+    mapfile -t PROFILES < <(list_profiles)
+    case ${#PROFILES[@]} in
+      1) PROFILE="${PROFILES[0]}" ;;
+      0) printf 'No profiles found in %s\n' "$CONF_ROOT" >&2
+         exit 1 ;;
+      # Watching the wrong account is watching the wrong directories, and the
+      # sync it would trigger is the wrong sync. There is no safe default.
+      *) printf 'Several profiles exist — name one with --profile=NAME:\n' >&2
+         printf '  %s\n' "${PROFILES[@]}" >&2
+         exit 2 ;;
+    esac
+  fi
+fi
+[[ -n "$PROFILE" ]] && export GDRIVE_PROFILE="$PROFILE"
+
 # --- Settings ---------------------------------------------------------------
-# The same block as in gdrive-sync: config directory from the environment, the
-# config file optional.
-CONF_DIR="${GDRIVE_CONF_DIR:-$HOME/.config/rclone-gdrive-sync}"
+# The same block as in gdrive-sync: config directory from the profile or the
+# environment, the config file optional.
+CONF_DIR="${GDRIVE_CONF_DIR:-$CONF_ROOT/$PROFILE}"
 CONFIG_FILE="$CONF_DIR/config.env"
 # shellcheck source=/dev/null
 [[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 FOLDERS="${GDRIVE_FOLDERS:-$CONF_DIR/folders.txt}"
-STATE_DIR="${GDRIVE_STATE_DIR:-$HOME/.local/state/rclone-gdrive-sync}"
+STATE_DIR="${GDRIVE_STATE_DIR:-$STATE_ROOT/$PROFILE}"
 WATCHER_FILE="$STATE_DIR/watcher.json"
 DEBOUNCE_SEC="${GDRIVE_DEBOUNCE_SEC:-5}"
 RETRY_SEC="${GDRIVE_RETRY_SEC:-30}"
@@ -257,14 +313,19 @@ Watches the synced folders with inotify and runs gdrive-sync for the folder
 that changed. Takes no arguments in normal use; settings come from the
 environment and from the config file.
 
+      --profile=NAME  Which Google account to watch. With exactly one profile
+                      it can be left out; with several it cannot
   -h, --help        This help
   -V, --version     Print the version and exit
 
+Profile:     ${PROFILE:-(none — GDRIVE_CONF_DIR given directly)}
 Settings:    $CONFIG_FILE (optional)
 Folder list: $FOLDERS
 HELP
         exit 0 ;;
       -V|--version) printf 'gdrive-watch %s\n' "$VERSION"; exit 0 ;;
+      # Consumed by the pre-scan above, before the config file was read.
+      --profile=*) ;;
       *) warn "Unknown option: $arg"; exit 2 ;;
     esac
   done

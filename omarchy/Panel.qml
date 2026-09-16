@@ -29,9 +29,18 @@ Panel {
   readonly property color stateColor: Model.stateIsUrgent(service.syncState)
     ? urgent
     : (Model.stateIsDim(service.syncState) ? dim : foreground)
-  readonly property color barStateColor: Model.stateIsUrgent(service.syncState)
+  // The bar speaks for every profile at once, the popup for the selected one.
+  // Splitting the two is the whole point: a picker alone would hide a work
+  // account that has been failing for days behind the personal one on screen.
+  readonly property color barStateColor: Model.stateIsUrgent(service.worstState)
     ? urgent
-    : (Model.stateIsDim(service.syncState) ? Qt.darker(barForeground, 1.55) : barForeground)
+    : (Model.stateIsDim(service.worstState) ? Qt.darker(barForeground, 1.55) : barForeground)
+
+  // The bar tooltip names the profile it is reporting on, but only once there
+  // is more than one and the name therefore carries information.
+  readonly property string barTooltip: Model.stateLabel(service.worstState) + " — "
+    + (service.profiles.length > 1 && service.worstProfile !== "" ? service.worstProfile + ": " : "")
+    + service.worstDetail
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -77,9 +86,9 @@ Panel {
 
     BarIconButton {
       bar: root.bar
-      text: Model.stateGlyph(service.syncState)
+      text: Model.stateGlyph(service.worstState)
       foreground: root.barStateColor
-      tooltipText: Model.stateLabel(service.syncState) + " — " + service.detail
+      tooltipText: root.barTooltip
       onPressed: function(buttonCode) { root.handlePress(buttonCode) }
     }
   }
@@ -89,10 +98,10 @@ Panel {
 
     WidgetButton {
       bar: root.bar
-      text: Model.stateGlyph(service.syncState) + "  " + Model.stateLabel(service.syncState)
+      text: Model.stateGlyph(service.worstState) + "  " + Model.stateLabel(service.worstState)
       foreground: root.barStateColor
       fontSize: Style.font.bodySmall
-      tooltipText: service.detail
+      tooltipText: root.barTooltip
       onPressed: function(buttonCode) { root.handlePress(buttonCode) }
     }
   }
@@ -130,6 +139,7 @@ Panel {
         else if (t === "o" || t === "O") root.run(service.openFolderCommand())
         else if (t === "l" || t === "L") root.run(service.openLogCommand())
         else if (t === "r" || t === "R") service.refresh()
+        else if (t === "p" || t === "P") service.selectNextProfile()
       }
 
       Flickable {
@@ -151,7 +161,9 @@ Panel {
           // Header: what the last run did, when, and what started it.
           PanelHero {
             width: parent.width
-            title: service.unconfigured ? "Google Drive" : service.header.title
+            title: service.unconfigured
+              ? (service.selectedProfile !== "" ? service.selectedProfile : "Google Drive")
+              : service.header.title
             meta: service.unconfigured ? "Not set up" : service.header.meta
             foreground: root.foreground
             fontFamily: root.fontFamily
@@ -162,6 +174,31 @@ Panel {
                 color: root.stateColor
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.display
+              }
+            }
+          }
+
+          // --- profile picker ---------------------------------------------------
+          //
+          // Only once a second account exists: with one profile the name is
+          // noise, and the popup already describes it.
+          Flow {
+            width: parent.width
+            spacing: Style.space(6)
+            visible: service.profiles.length > 1
+
+            Repeater {
+              model: service.profileSummaries
+
+              ProfileChip {
+                required property var modelData
+
+                profile: modelData.profile
+                glyph: Model.stateGlyph(modelData.state)
+                attention: modelData.attention
+                urgentState: Model.stateIsUrgent(modelData.state)
+                selected: modelData.profile === service.selectedProfile
+                onActivated: service.selectProfile(modelData.profile)
               }
             }
           }
@@ -189,8 +226,11 @@ Panel {
             Text {
               width: parent.width
               textFormat: Text.PlainText
-              text: "gdrive-sync is not installed or has no folders to sync. The widget installs "
-                + "nothing itself; run the installer and pick your folders."
+              text: service.profiles.length === 0
+                ? "No profile exists yet. The widget installs nothing itself; run the installer "
+                  + "with --profile=NAME to set an account up."
+                : "gdrive-sync is not installed or this profile has no folders to sync. The widget "
+                  + "installs nothing itself; run the installer and pick your folders."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -373,6 +413,15 @@ Panel {
             // working exactly as they do for the timer.
             ActionRow {
               width: parent.width
+              visible: service.profiles.length > 1
+              glyph: "󰤼"                        // md-swap_horizontal
+              label: "Next profile"
+              hint: "p"
+              onActivated: service.selectNextProfile()
+            }
+
+            ActionRow {
+              width: parent.width
               glyph: "󰓦"                        // md-sync
               label: "Sync now"
               hint: "s"
@@ -444,6 +493,65 @@ Panel {
           }
         }
       }
+    }
+  }
+
+  // One profile in the picker: its name, its own state glyph, and a mark when
+  // it needs attention. The glyph is what makes the picker honest — a name
+  // alone would say which account is selected but not which one is broken.
+  component ProfileChip: Rectangle {
+    id: profileChip
+
+    property string profile: ""
+    property string glyph: ""
+    property bool attention: false
+    property bool urgentState: false
+    property bool selected: false
+
+    signal activated()
+
+    implicitWidth: chipRow.implicitWidth + Style.space(16)
+    implicitHeight: chipRow.implicitHeight + Style.space(8)
+    radius: Style.cornerRadius
+    color: profileChip.selected || chipArea.containsMouse
+      ? Style.hoverFillFor(root.foreground, Color.accent)
+      : "transparent"
+    border.width: profileChip.selected ? 1 : 0
+    border.color: root.foreground
+    Behavior on color { ColorAnimation { duration: 60 } }
+
+    Row {
+      id: chipRow
+      anchors.centerIn: parent
+      spacing: Style.space(6)
+
+      Text {
+        textFormat: Text.PlainText
+        anchors.verticalCenter: parent.verticalCenter
+        text: profileChip.glyph
+        color: profileChip.urgentState
+          ? root.urgent
+          : (profileChip.attention ? root.dim : root.foreground)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.icon
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        anchors.verticalCenter: parent.verticalCenter
+        text: profileChip.profile
+        color: profileChip.selected ? root.foreground : root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+    }
+
+    MouseArea {
+      id: chipArea
+      anchors.fill: parent
+      hoverEnabled: true
+      cursorShape: Qt.PointingHandCursor
+      onClicked: profileChip.activated()
     }
   }
 

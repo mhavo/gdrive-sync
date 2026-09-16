@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Bidirectional rclone bisync for selected Google Drive folders.
-# Folder list: $GDRIVE_CONF_DIR/folders.txt, by default
-# ~/.config/rclone-gdrive-sync/folders.txt. Settings live in the same directory
-# in config.env (optional).
+# Folder list: $CONF_DIR/folders.txt, where CONF_DIR is the directory of the
+# profile being synced — by default ~/.config/gdrive-sync/<profile>. Settings
+# live in the same directory in config.env (optional).
+#
+# One Google account is one profile. Profiles are equals: there is no default
+# account and no primary, and each one owns its folders.txt, filter.txt and
+# config.env.
 #
 # A folder is written into the list as a name, but the remote side is addressed
 # by its Drive folder ID: on the first run the name is resolved to an ID and the
@@ -13,25 +17,102 @@ set -uo pipefail
 
 VERSION="0.1.0"
 
+# --- Profiles ---------------------------------------------------------------
+# A profile is a directory name under the two roots, and nothing else. There is
+# no registry file: a second source of truth beside the directory layout would
+# be free to disagree with it, and every other setting already lives in the
+# profile's own directory.
+CONF_ROOT="${GDRIVE_CONF_ROOT:-$HOME/.config/gdrive-sync}"
+STATE_ROOT="${GDRIVE_STATE_ROOT:-$HOME/.local/state/gdrive-sync}"
+PROFILE="${GDRIVE_PROFILE:-}"
+# An empty --profile= is a mistake, not an omission, and is refused as one.
+# Without this flag it would be indistinguishable from not passing the option.
+PROFILE_GIVEN=0
+
+# A profile name becomes a path segment and a systemd instance name at once.
+# Anything outside this set would either escape the root or demand
+# systemd-escape, so it is refused rather than mangled.
+profile_valid() {
+  local name="$1"
+  [[ -n "$name" && "$name" != "." && "$name" != ".." ]] || return 1
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+# The directory listing is the profile list. Kept in one place for the same
+# reason line parsing is: install.sh and the Omarchy widget both read it from
+# here (--list-profiles) instead of scanning the directory themselves.
+list_profiles() {
+  local dir name
+  for dir in "$CONF_ROOT"/*/; do
+    [[ -d "$dir" ]] || continue
+    name="${dir%/}"; name="${name##*/}"
+    profile_valid "$name" || continue
+    printf '%s\n' "$name"
+  done
+}
+
+# --profile= has to be read before the Settings block, because CONF_DIR decides
+# which config.env is read and the file cannot name the directory it lives in.
+# This is the same documented exception GDRIVE_CONF_DIR already has. The equals
+# form only, matching --only= and --repin=.
+for arg in "$@"; do
+  case "$arg" in
+    --profile=*)     PROFILE="${arg#--profile=}"; PROFILE_GIVEN=1 ;;
+    # Answered here so that it still answers when no profile can be resolved —
+    # which is exactly the situation its callers ask about.
+    --list-profiles) list_profiles; exit 0 ;;
+  esac
+done
+
+# An explicit GDRIVE_CONF_DIR or GDRIVE_STATE_DIR wins over the profile. With
+# both of them given the account has been named directly and no profile is
+# needed at all.
+if [[ -z "${GDRIVE_CONF_DIR:-}" || -z "${GDRIVE_STATE_DIR:-}" ]]; then
+  if [[ -n "$PROFILE" ]] || (( PROFILE_GIVEN )); then
+    if ! profile_valid "$PROFILE"; then
+      echo "Invalid profile name: $PROFILE" >&2
+      echo "A profile name is one path segment of [A-Za-z0-9._-], not . or .." >&2
+      exit 2
+    fi
+  else
+    mapfile -t PROFILES < <(list_profiles)
+    case ${#PROFILES[@]} in
+      1) PROFILE="${PROFILES[0]}" ;;
+      0) echo "No profiles found in $CONF_ROOT" >&2
+         echo "Create one:  install.sh --profile=NAME --remote=REMOTE" >&2
+         exit 1 ;;
+      # Guessing here means the wrong account, and deletions propagating to the
+      # wrong Drive. With more than one profile there is no safe default, so
+      # there is no default.
+      *) echo "Several profiles exist — name one with --profile=NAME:" >&2
+         printf '  %s\n' "${PROFILES[@]}" >&2
+         exit 2 ;;
+    esac
+  fi
+fi
+
 # --- Settings ---------------------------------------------------------------
 # The config file is optional. Without it the behaviour is the same as before it
-# existed. The directory location comes from the environment (GDRIVE_CONF_DIR),
-# because it has to be known before the file can be read; setting
-# GDRIVE_CONF_DIR inside the file therefore has no effect.
+# existed. The directory location comes from the profile, or from the
+# environment (GDRIVE_CONF_DIR), because it has to be known before the file can
+# be read; setting GDRIVE_CONF_DIR inside the file therefore has no effect, and
+# neither does setting GDRIVE_PROFILE.
 #
 # Note: source runs the file as bash code. It is the user's own config file, but
 # keep its permissions to yourself.
-CONF_DIR="${GDRIVE_CONF_DIR:-$HOME/.config/rclone-gdrive-sync}"
+CONF_DIR="${GDRIVE_CONF_DIR:-$CONF_ROOT/$PROFILE}"
 CONFIG_FILE="$CONF_DIR/config.env"
 # shellcheck source=/dev/null
 [[ -r "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
 
 REMOTE="${GDRIVE_REMOTE:-GoogleDrive}"
 REMOTE="${REMOTE%:}"          # the spelling "GoogleDrive:" is allowed
-LOCAL_ROOT="${GDRIVE_LOCAL:-$HOME/GoogleDrive}"
+# Per profile by default, which makes the common case non-colliding by
+# construction — see check_local_collisions below for what a collision costs.
+LOCAL_ROOT="${GDRIVE_LOCAL:-$HOME/GoogleDrive${PROFILE:+/$PROFILE}}"
 FOLDERS="${GDRIVE_FOLDERS:-$CONF_DIR/folders.txt}"
 FILTER="${GDRIVE_FILTER:-$CONF_DIR/filter.txt}"
-STATE_DIR="${GDRIVE_STATE_DIR:-$HOME/.local/state/rclone-gdrive-sync}"
+STATE_DIR="${GDRIVE_STATE_DIR:-$STATE_ROOT/$PROFILE}"
 INIT_DIR="$STATE_DIR/initialized"
 LOCK="$STATE_DIR/lock"
 STATUS_FILE="$STATE_DIR/status.json"
@@ -50,6 +131,10 @@ for arg in "$@"; do
     --only=*)      ONLY="${arg#--only=}" ;;
     --status)      ACTION="status" ;;
     --list-paths)  ACTION="list-paths" ;;
+    # Both are consumed by the pre-scan above; listed so that they are not
+    # reported as unknown options here.
+    --profile=*)   ;;
+    --list-profiles) ;;
     --repin)       ACTION="repin"; REPIN="" ;;
     --repin=*)     ACTION="repin"; REPIN="${arg#--repin=}" ;;
     --allow-empty-remote) ALLOW_EMPTY=1 ;;
@@ -66,6 +151,9 @@ gdrive-sync [options]
                       (no network, no lock; gdrive-watch reads this)
       --repin[=NAME]  Resolve the folder ID again from the name
                       (requires reinitialisation next, done automatically)
+      --profile=NAME  Which Google account to sync. With exactly one profile
+                      it can be left out; with several it cannot
+      --list-profiles Print the profiles, one per line, and exit
       --allow-empty-remote
                     Allow the run even if the remote folder is empty and the
                     local one is not. Use only when you emptied the folder in
@@ -73,9 +161,11 @@ gdrive-sync [options]
   -h, --help        This help
   -V, --version     Print the version and exit
 
+Profile:     ${PROFILE:-(none — GDRIVE_CONF_DIR given directly)}
 Settings:    $CONFIG_FILE (optional)
 Folder list: $FOLDERS
-Logs:        journalctl --user -u gdrive-sync (or stdout when run by hand)
+Local root:  $LOCAL_ROOT
+Logs:        journalctl --user -u gdrive-sync@${PROFILE:-PROFILE} (or stdout when run by hand)
 HELP
       exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
@@ -290,6 +380,56 @@ status_finish() {
   local rc=$?
   status_write "$(date --iso-8601=seconds)" "$rc"
 }
+
+# --- Local root collisions --------------------------------------------------
+# Two profiles under one local root, or under nested roots, means each one's
+# bisync sees the other's files as local changes and carries their absence to
+# its own Drive. The failure is silent, bidirectional and not obviously
+# recoverable, so it is refused before the run rather than diagnosed after it.
+
+# config.env is bash. Sourcing another profile's file into this shell would
+# overwrite the settings of the profile actually being synced — the check would
+# corrupt the run it exists to protect — so each one is read in a subshell that
+# prints only the resulting local root.
+other_profile_local() {
+  local name="$1"
+  ( set +u
+    GDRIVE_LOCAL=""
+    # shellcheck source=/dev/null
+    [[ -r "$CONF_ROOT/$name/config.env" ]] && source "$CONF_ROOT/$name/config.env"
+    printf '%s\n' "${GDRIVE_LOCAL:-$HOME/GoogleDrive/$name}" )
+}
+
+# The comparison is on realpath output: a symlink must not be able to hide a
+# nesting relationship. -m, because a root that does not exist yet is the
+# normal case on a freshly created profile.
+check_local_collisions() {
+  local mine other other_root name
+  mine="$(realpath -m -- "$LOCAL_ROOT")" || return 0
+  while IFS= read -r name; do
+    [[ -n "$name" && "$name" != "$PROFILE" ]] || continue
+    other_root="$(other_profile_local "$name")"
+    [[ -n "$other_root" ]] || continue
+    other="$(realpath -m -- "$other_root")" || continue
+    if [[ "$mine" == "$other" || "$mine" == "$other"/* || "$other" == "$mine"/* ]]; then
+      echo "Local root collision with profile '$name':" >&2
+      printf "  this profile ('%s'): %s\n" "$PROFILE" "$mine" >&2
+      printf "  profile '%s': %s\n" "$name" "$other" >&2
+      echo "Two profiles may not share or nest their local roots — each one's" >&2
+      echo "bisync would carry the other's files to its own Drive as deletions." >&2
+      return 1
+    fi
+  done < <(list_profiles)
+  return 0
+}
+
+# Only the actions that address the folders. --status and --list-paths report
+# on a configuration without touching data, and must keep working while a
+# collision is being fixed. A preview is checked too: -n exists to show what a
+# real run would do, and a real run here would be refused.
+if [[ -n "$PROFILE" && ( "$ACTION" == "sync" || "$ACTION" == "repin" ) ]]; then
+  check_local_collisions || exit 1
+fi
 
 # Real runs create and lock persistent state. A dry-run takes the existing lock
 # read-only when one exists, but does not create state merely to preview work.

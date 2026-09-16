@@ -1,4 +1,5 @@
-# Google Drive folders to sync bidirectionally into ~/GoogleDrive
+# Google Drive folders to sync bidirectionally into this profile's local root
+# (~/GoogleDrive/<profile> by default)
 #
 # One folder per line, path from the root of Drive. Subfolders are fine:
 #   Projects/2026
@@ -8,7 +9,7 @@
 # pinned in a state file. After that, renaming the folder in Drive does not
 # affect syncing. To give the ID directly, write the line as
 #   id:<folder ID>  <name of the local directory>
-# Current IDs and Drive names: gdrive-sync --status
+# Current IDs and Drive names: gdrive-sync --profile=<profile> --status
 
 # PUT YOUR CHOSEN FOLDERS HERE, for example:
 #Documents

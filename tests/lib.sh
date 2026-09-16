@@ -79,7 +79,44 @@ make_sandbox() {
   : > "$RCLONE_CALLS"
 }
 
-cleanup_sandbox() { [[ -n "${SANDBOX:-}" ]] && rm -rf "$SANDBOX"; }
+# The profile layout, for the tests that are about profiles rather than about
+# syncing. It sets the two roots and leaves GDRIVE_CONF_DIR and
+# GDRIVE_STATE_DIR unset, which is what makes the profile the thing being
+# resolved — make_sandbox pins both directly and so never resolves one.
+make_profile_sandbox() {
+  SANDBOX="$(mktemp -d)"
+  unset GDRIVE_CONF_DIR GDRIVE_STATE_DIR GDRIVE_LOCAL GDRIVE_PROFILE
+  export GDRIVE_CONF_ROOT="$SANDBOX/config"
+  export GDRIVE_STATE_ROOT="$SANDBOX/state"
+  # The defaults being tested are relative to HOME, so HOME has to be inside
+  # the sandbox. cleanup_sandbox puts the real one back.
+  SANDBOX_OLD_HOME="$HOME"
+  export HOME="$SANDBOX/home"
+  export RCLONE_CALLS="$SANDBOX/rclone-calls.log"
+  export PATH="$REPO_ROOT/tests/fake-bin:$PATH"
+  mkdir -p "$GDRIVE_CONF_ROOT" "$GDRIVE_STATE_ROOT" "$HOME"
+  : > "$RCLONE_CALLS"
+}
+
+# One profile: its directory, an empty filter, and a config.env naming its own
+# local root. Takes the profile name and, optionally, the local root.
+make_profile() {
+  local name="$1" local_root="${2:-$SANDBOX/local/$1}"
+  local dir="$GDRIVE_CONF_ROOT/$name"
+  mkdir -p "$dir" "$local_root"
+  : > "$dir/filter.txt"
+  printf 'Documents\n' > "$dir/folders.txt"
+  {
+    printf 'GDRIVE_REMOTE=Remote_%s\n' "$name"
+    printf 'GDRIVE_LOCAL=%s\n' "$local_root"
+  } > "$dir/config.env"
+}
+
+cleanup_sandbox() {
+  [[ -n "${SANDBOX_OLD_HOME:-}" ]] && { export HOME="$SANDBOX_OLD_HOME"; SANDBOX_OLD_HOME=""; }
+  [[ -n "${SANDBOX:-}" ]] && rm -rf "$SANDBOX"
+  return 0
+}
 
 write_folders() { cat > "$GDRIVE_CONF_DIR/folders.txt"; }
 
